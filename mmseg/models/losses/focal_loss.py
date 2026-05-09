@@ -2,7 +2,11 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from mmcv.ops import sigmoid_focal_loss as _sigmoid_focal_loss
+try:
+    from mmcv.ops import sigmoid_focal_loss as _sigmoid_focal_loss
+except ModuleNotFoundError:
+    # 无 mmcv-full 扩展时使用下方 PyTorch 实现，保证新显卡环境可先跑通。
+    _sigmoid_focal_loss = None
 
 from ..builder import LOSSES
 from .utils import weight_reduce_loss
@@ -136,6 +140,12 @@ def sigmoid_focal_loss(pred,
     """
     # Function.apply does not accept keyword arguments, so the decorator
     # "weighted_loss" is not applicable
+    if _sigmoid_focal_loss is None:
+        num_classes = pred.size(1)
+        target = F.one_hot(target, num_classes=num_classes + 1)
+        target = target[:, :num_classes]
+        return py_sigmoid_focal_loss(pred, target, weight, gamma, alpha,
+                                     reduction, avg_factor)
     loss = _sigmoid_focal_loss(pred.contiguous(), target.contiguous(), gamma,
                                alpha, None, 'none')
     if weight is not None:

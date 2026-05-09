@@ -2,9 +2,44 @@
 import warnings
 
 import mmcv
+import numpy as np
+import torch
 from packaging.version import parse
 
 from .version import __version__, version_info
+
+# 兼容 NumPy 2.x：旧代码仍使用 np.float/np.int/np.bool 这些别名。
+for _name, _value in {
+        'float': float,
+        'int': int,
+        'bool': bool,
+        'object': object,
+}.items():
+    if not hasattr(np, _name):
+        setattr(np, _name, _value)
+
+
+def _patch_mmcv_scatter_get_stream():
+    # 兼容 torch 2.x：旧版 mmcv scatter 会把整数 GPU id 传给 _get_stream。
+    try:
+        from mmcv.parallel import _functions as mmcv_parallel_functions
+    except Exception:
+        return
+
+    original_get_stream = mmcv_parallel_functions._get_stream
+    if getattr(original_get_stream, '_anchor3dlane_compat', False):
+        return
+
+    def get_stream_compat(device):
+        if isinstance(device, int):
+            device = torch.device('cuda', device)
+        return original_get_stream(device)
+
+    get_stream_compat._anchor3dlane_compat = True
+    mmcv_parallel_functions._get_stream = get_stream_compat
+
+
+_patch_mmcv_scatter_get_stream()
 
 MMCV_MIN = '1.3.13'
 MMCV_MAX = '1.7.2'

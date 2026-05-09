@@ -21,17 +21,15 @@ from torch.autograd.function import once_differentiable
 try:
     import MultiScaleDeformableAttention as MSDA
 except ModuleNotFoundError as e:
-    info_string = (
-        "\n\nPlease compile MultiScaleDeformableAttention CUDA op with the following commands:\n"
-        "\t`cd mask2former/modeling/pixel_decoder/ops`\n"
-        "\t`sh make.sh`\n"
-    )
-    raise ModuleNotFoundError(info_string)
+    # 新版 5090 环境下旧 CUDA 扩展可能无法直接编译，允许模块导入后走 PyTorch fallback。
+    MSDA = None
 
 
 class MSDeformAttnFunction(Function):
     @staticmethod
     def forward(ctx, value, value_spatial_shapes, value_level_start_index, sampling_locations, attention_weights, im2col_step):
+        if MSDA is None:
+            raise RuntimeError('MultiScaleDeformableAttention extension is not available')
         ctx.im2col_step = im2col_step
         output = MSDA.ms_deform_attn_forward(
             value, value_spatial_shapes, value_level_start_index, sampling_locations, attention_weights, ctx.im2col_step)

@@ -7,8 +7,26 @@ Date: March, 2020
 
 from __future__ import print_function
 import numpy as np
-from ortools.graph import pywrapgraph
 import time
+try:
+    from ortools.graph import pywrapgraph
+except ImportError:
+    pywrapgraph = None
+from scipy.optimize import linear_sum_assignment
+
+
+def _solve_by_hungarian(adj_mat, cost_mat):
+    cnt_1, cnt_2 = adj_mat.shape
+    if cnt_1 == 0 or cnt_2 == 0:
+        return []
+    safe_cost = cost_mat.astype(float).copy()
+    safe_cost[adj_mat == 0] = 1e9
+    row_ind, col_ind = linear_sum_assignment(safe_cost)
+    match_results = []
+    for row, col in zip(row_ind, col_ind):
+        if adj_mat[row, col] > 0 and safe_cost[row, col] < 1e9:
+            match_results.append([int(row), int(col), int(cost_mat[row, col])])
+    return match_results
 
 
 def SolveMinCostFlow(adj_mat, cost_mat):
@@ -18,6 +36,9 @@ def SolveMinCostFlow(adj_mat, cost_mat):
     :param cost_mat: cost matrix recording the matching cost of every possible pair of items from two sets
     :return:
     """
+    if pywrapgraph is None:
+        # 新版 OR-Tools 移除了旧 pywrapgraph 入口，使用 Hungarian 匹配作为等价 fallback。
+        return _solve_by_hungarian(adj_mat, cost_mat)
 
     # Instantiate a SimpleMinCostFlow solver.
     min_cost_flow = pywrapgraph.SimpleMinCostFlow()

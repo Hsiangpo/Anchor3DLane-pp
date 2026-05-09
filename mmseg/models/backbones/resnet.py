@@ -1,14 +1,78 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import warnings
+import math
 
+import torch
 import torch.nn as nn
 import torch.utils.checkpoint as cp
 from mmcv.cnn import build_conv_layer, build_norm_layer, build_plugin_layer
+from mmcv.cnn.bricks.conv import CONV_LAYERS
 from mmcv.runner import BaseModule
 from mmcv.utils.parrots_wrapper import _BatchNorm
+from torch.nn.modules.utils import _pair
+from torchvision.ops import deform_conv2d
 
 from ..builder import BACKBONES
 from ..utils import ResLayer
+
+
+class CompatDCNv2(nn.Module):
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 kernel_size,
+                 stride=1,
+                 padding=0,
+                 dilation=1,
+                 groups=1,
+                 bias=True,
+                 deform_groups=1,
+                 **kwargs):
+        super().__init__()
+        self.stride = _pair(stride)
+        self.padding = _pair(padding)
+        self.dilation = _pair(dilation)
+        self.groups = groups
+        self.deform_groups = deform_groups
+        self.kernel_size = _pair(kernel_size)
+        self.weight = nn.Parameter(
+            torch.empty(out_channels, in_channels // groups,
+                        self.kernel_size[0], self.kernel_size[1]))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_channels))
+        else:
+            self.register_parameter('bias', None)
+        offset_channels = deform_groups * 3 * self.kernel_size[0] * self.kernel_size[1]
+        self.conv_offset = nn.Conv2d(
+            in_channels,
+            offset_channels,
+            kernel_size=self.kernel_size,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+            bound = 1 / math.sqrt(fan_in)
+            nn.init.uniform_(self.bias, -bound, bound)
+        nn.init.constant_(self.conv_offset.weight, 0)
+        nn.init.constant_(self.conv_offset.bias, 0)
+
+    def forward(self, x):
+        offset_mask = self.conv_offset(x)
+        offset_x, offset_y, mask = torch.chunk(offset_mask, 3, dim=1)
+        offset = torch.cat((offset_x, offset_y), dim=1)
+        mask = torch.sigmoid(mask)
+        return deform_conv2d(x, offset, self.weight, self.bias, self.stride,
+                             self.padding, self.dilation, mask)
+
+
+if 'DCNv2' not in CONV_LAYERS.module_dict:
+    # mmcv-full 旧扩展无法在 RTX 5090 + torch2.8 上直接编译，注册 torchvision 兼容实现。
+    CONV_LAYERS.register_module(name='DCNv2', module=CompatDCNv2)
 
 
 class BasicBlock(BaseModule):

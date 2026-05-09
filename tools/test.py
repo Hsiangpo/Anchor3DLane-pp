@@ -96,7 +96,7 @@ def parse_args():
         type=float,
         default=0.5,
         help='Opacity of painted segmentation map. In (0, 1] range.')
-    parser.add_argument('--local_rank', type=int, default=0)
+    parser.add_argument('--local_rank', '--local-rank', type=int, default=0)
     args = parser.parse_args()
     if 'LOCAL_RANK' not in os.environ:
         os.environ['LOCAL_RANK'] = str(args.local_rank)
@@ -230,10 +230,10 @@ def main():
         
         test_multigpu(model,
                       data_loader,
-                      args.eval,
-                      args.eval_splits,
-                      args.show,
-                      args.show_dir)
+                      eval=args.eval,
+                      eval_splits=args.eval_splits,
+                      show=args.show,
+                      out_dir=args.show_dir)
 
 
 if __name__ == '__main__':

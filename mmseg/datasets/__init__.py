@@ -13,7 +13,11 @@ from .hrf import HRFDataset
 from .isaid import iSAIDDataset
 from .isprs import ISPRSDataset
 from .lane_datasets.apollosim import APOLLOSIMDataset
-from .lane_datasets.once import ONCEDataset
+try:
+    from .lane_datasets.once import ONCEDataset
+except ModuleNotFoundError:
+    # ONCE 数据集依赖 jarvis，OpenLane/ApolloSim 主流程不应被这个可选依赖阻塞。
+    ONCEDataset = None
 from .lane_datasets.openlane import OpenlaneDataset
 from .lane_datasets.openlane_lidar import OpenlaneLidarDataset
 from .lane_datasets.openlane_temporal import OpenlaneMFDataset

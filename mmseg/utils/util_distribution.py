@@ -56,6 +56,15 @@ def build_ddp(model, device='cuda', *args, **kwargs):
     assert device in ['cuda', 'mlu'], 'Only available for cuda or mlu devices.'
     if device == 'cuda':
         model = model.cuda()
+        if kwargs.get('device_ids') is not None:
+            kwargs['device_ids'] = [
+                torch.device('cuda', device_id)
+                if isinstance(device_id, int) else device_id
+                for device_id in kwargs['device_ids']
+            ]
+        if isinstance(kwargs.get('output_device'), int):
+            kwargs['output_device'] = torch.device(
+                'cuda', kwargs['output_device'])
     elif device == 'mlu':
         assert digit_version(mmcv.__version__) >= digit_version('1.5.0'), \
             'Please use MMCV >= 1.5.0 for MLU training!'
@@ -63,7 +72,11 @@ def build_ddp(model, device='cuda', *args, **kwargs):
         ddp_factory['mlu'] = MLUDistributedDataParallel
         model = model.mlu()
 
-    return ddp_factory[device](model, *args, **kwargs)
+    model = ddp_factory[device](model, *args, **kwargs)
+    # 兼容 torch 2.x 新版 DDP 内部属性，避免 mmcv 1.x 前向时取不到字段。
+    if not hasattr(model, '_use_replicated_tensor_module'):
+        model._use_replicated_tensor_module = False
+    return model
 
 
 def is_mlu_available():

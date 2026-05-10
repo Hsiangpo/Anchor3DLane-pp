@@ -1,4 +1,4 @@
-[系统状态]：Anchor3DLane-pp is deployed and the official checkpoint baseline is reproduced on OpenLane validation, current stable F1 = 62.521; ApolloSim is not mounted yet.
+[系统状态]：Anchor3DLane-pp is deployed and the official checkpoint baseline is reproduced on OpenLane validation, current stable F1 = 62.543; latest successful experiment is `vdcc`; ApolloSim is not mounted yet.
 
 # Anchor3DLane-pp Agent Notes
 
@@ -35,11 +35,41 @@
   - Result file: `/root/autodl-tmp/Anchor3DLane-pp/output/openlane/baseline_eval/evaluation_result.json`
   - Metrics: F1 `0.6240448139487519`, recall `0.613268850798542`, precision `0.6352062468171787`, category accuracy `0.9337897428296154`.
 - Current stable score:
-  - Experiment: `strip_sample` / projection-aware local lane-strip sampling.
-  - Result file: `/root/autodl-tmp/Anchor3DLane-pp/output/openlane/experiments/strip_sample_r50x2_eval/evaluation_result.json`.
-  - Metrics: F1 `0.6252112086013109`, recall `0.6098164672986526`, precision `0.6414033570289482`, category accuracy `0.9344681247959707`.
-  - Improvement over official checkpoint baseline: `+0.001166394652559` F1, or `+0.116639` points on the 0-100 reporting scale.
+  - Experiment: `strip_sample + vdcc` / visibility-weighted differential curve consistency.
+  - Result file: `/root/autodl-tmp/Anchor3DLane-pp/output/openlane/experiments/vdcc_r50x2_eval/evaluation_result.json`.
+  - Metrics: F1 `0.6254260715979268`, recall `0.6176413943634846`, precision `0.6334094879720468`, category accuracy `0.9355990687233905`.
+  - Improvement over previous stable `strip_sample`: `+0.0002148629966159` F1, or `+0.021486` points on the 0-100 reporting scale.
+  - Improvement over official checkpoint baseline: `+0.0013812576491749` F1, or `+0.138126` points on the 0-100 reporting scale.
+- Latest successful score-improvement experiment:
+  - Selected idea: V-DCC / Visibility-weighted Differential Curve Consistency.
+  - Rationale: `strip_sample` improved local image evidence but still regresses 3D lanes point-by-point. V-DCC adds a final-only, visibility-masked first/second differential curve consistency loss against GT x-curve geometry, using real y-step spacing. It does not add proposals, feature sampling freedom, matcher changes, confidence calibration, visibility BCE, or learned anchor priors.
+  - Research: three `gpt-5.5 xhigh` subagents proposed V-DCC, GSPR, and PUME. V-DCC was selected first because it is a pure geometry-supervision signal with no new model parameters and the lowest risk of hurting precision through extra texture aggregation.
+  - Code: `mmseg/models/losses/lane_loss_v2.py` adds optional `curve_geom_losses`, `curve_geom_axes`, `curve_slope_weight`, and `curve_curv_weight`. Default configs are unchanged unless `curve_geom_losses` is present in `loss_weights`.
+  - Config: `configs_v2/openlane/experiments/anchor3dlane++_r50x2_vdcc.py`, loading `output/openlane/experiments/strip_sample_r50x2/iter_10000.pth`, `samples_per_gpu=3`, `lr=1e-5`, `max_iters=10000`, final feature level/final refinement only.
+  - Code review subagent found no blocking OOM, tensor-shape, DDP, checkpoint-load, gradient, default-behavior, or failed-route issue.
+  - Local checks passed: `python -m py_compile mmseg/models/losses/lane_loss_v2.py` and `git diff --check`.
+  - Remote config/model/checkpoint load passed with zero missing and unexpected keys.
+  - Remote loss sanity passed on synthetic matched proposal/GT data with finite losses.
+  - Remote 2-GPU DDP 1-iteration and 20-iteration smoke passed with finite loss/grad, no OOM/Traceback/NaN/DDP hard error, and memory about 27.4GB per GPU.
+  - Formal 2-GPU training completed from `logs/train_vdcc_20260510_212223.log` and produced `output/openlane/experiments/vdcc_r50x2/iter_10000.pth`.
+  - Formal validation evaluation completed from `logs/eval_vdcc_20260510_221650.log`.
+  - Result file: `output/openlane/experiments/vdcc_r50x2_eval/evaluation_result.json`.
+  - Decision: improved over current stable `strip_sample` F1 `0.6252112086013109`; keep the implementation, record it in `docs/实验记录.md`, and commit/push this stable version.
 - Completed score-improvement experiments:
+  - `far_semantic_fuse` added a zero-initialized far-range semantic residual from `anchor_feats[1]` only at `y >= 40m` on the final feature level and final refinement.
+  - Formal 2-GPU training completed from `logs/train_far_semantic_fuse_20260510_195436.log` and produced `output/openlane/experiments/far_semantic_fuse_r50x2/iter_10000.pth`.
+  - Formal validation evaluation completed from `logs/eval_far_semantic_fuse_20260510_204903.log`.
+  - Result file: `/root/autodl-tmp/Anchor3DLane-pp/output/openlane/experiments/far_semantic_fuse_r50x2_eval/evaluation_result.json`.
+  - Metrics: F1 `0.6230222048695299`, recall `0.6088392430435186`, precision `0.6378817135092613`, category accuracy `0.9329910283977163`.
+  - Decision: regressed below current stable F1 `0.6252112086013109` and official baseline F1 `0.6240448139487519`; failed implementation code and config were rolled back, and the failure was documented in `docs/失败路线.md`.
+  - Avoid repeating standalone far-range semantic residual fusion from `anchor_feats[1]` or only tuning `semantic_fuse_far_y`, `semantic_fuse_alpha_init`, or source feature level.
+  - `curve_prior` added a zero-initialized learned quadratic 3D anchor prior on top of the stable `strip_sample` checkpoint.
+  - Formal 2-GPU training completed from `logs/train_curve_prior_20260510_181104.log` and produced `output/openlane/experiments/curve_prior_r50x2/iter_10000.pth`.
+  - Formal validation evaluation completed from `logs/eval_curve_prior_20260510_190611.log`.
+  - Result file: `/root/autodl-tmp/Anchor3DLane-pp/output/openlane/experiments/curve_prior_r50x2_eval/evaluation_result.json`.
+  - Metrics: F1 `0.6237906288117906`, recall `0.6097665361323319`, precision `0.6384749906315245`, category accuracy `0.9328194036196921`.
+  - Decision: regressed below current stable F1 `0.6252112086013109` and official baseline F1 `0.6240448139487519`; failed implementation code and config were rolled back, and the failure was documented in `docs/失败路线.md`.
+  - Avoid repeating learned quadratic anchor prior or only tuning `curve_prior_scale`, `curve_prior_mode`, or enabled layers.
   - `vis_bce` changed visibility supervision from SmoothL1 to BCE with positive weighting.
   - Formal 2-GPU training completed from `logs/train_vis_bce_retry_20260510_082812.log` and produced `output/openlane/experiments/vis_bce_r50x2/iter_10000.pth`.
   - Formal validation evaluation completed from `logs/eval_vis_bce_20260510_091100.log`.
@@ -65,7 +95,39 @@
   - Remote config load passed with `samples_per_gpu=2`, `max_iters=10000`, `cost_eval=0.5`, `cost_vis=0.0`, loading `checkpoints/Openlane/openlane_anchor3dlane++_r50x2.pth`.
   - Remote matcher sanity passed: default matcher output equals the previous cost formula; enabled eval cost returns finite `[30, 6]` matrices.
   - Remote 2-GPU DDP smoke passed for 1 and 20 iterations. The 20-iter run had finite losses and gradients, logged memory about 24.7GB, and no OOM/Traceback/NaN.
-- Current score-improvement experiment:
+- Latest failed score-improvement experiment:
+  - Selected idea: geometry-normal strip residual fusion.
+  - Rationale: `strip_sample` only samples horizontal image offsets. This experiment keeps the stable horizontal strip branch and adds a geometry-derived normal-direction strip branch along the projected lane curve, fused by one global scalar gate. It does not use content-based per-point offset weights.
+  - Code: `mmseg/models/lane_detector/anchor_3dlane_pp.py` temporarily added optional `strip_normal_sample` and `strip_normal_alpha_logit`; failed code has been rolled back, preserving stable `strip_sample`.
+  - Config: `configs_v2/openlane/experiments/anchor3dlane++_r50x2_strip_normal.py`; failed config has been removed.
+  - Research subagents proposed three options; this one was selected because it is closest to the successful `strip_sample` mechanism and avoids all recorded failed loss/matcher/threshold/content-attention routes.
+  - Code review subagent found no blocking OOM, tensor-shape, DDP, checkpoint-load, or default-behavior issue. Two defensive fixes were added: fallback for `anchor_feat_len <= 1` and finite-value checking in normal-vector construction.
+  - Remote config/model build passed: `samples_per_gpu=3`, `strip_normal_sample=True`, initial `alpha≈0.018`, loading `output/openlane/experiments/strip_sample_r50x2/iter_10000.pth`; only expected new missing key was `strip_normal_alpha_logit`.
+  - Remote 2-GPU DDP 1-iteration and 20-iteration smoke passed with finite losses/gradients, memory about 27.4GB, and no OOM/Traceback/NaN/DDP hard error.
+  - Formal 2-GPU training completed with PID file `logs/train_strip_normal.pid`, log `logs/train_strip_normal_20260510_164642.log`, and work dir `output/openlane/experiments/strip_normal_r50x2`.
+  - Formal validation evaluation completed with PID file `logs/eval_strip_normal.pid`, log `logs/eval_strip_normal_20260510_174102.log`, and result path `output/openlane/experiments/strip_normal_r50x2_eval/evaluation_result.json`.
+  - Metrics: F1 `0.6238861006258989`, recall `0.6163788491579465`, precision `0.6315784775778349`, category accuracy `0.9327178367577269`.
+  - Decision: regressed below current stable F1 `0.6252112086013109` and official baseline F1 `0.6240448139487519`; failed implementation code and config were rolled back, and the failure was documented in `docs/失败路线.md`.
+  - Failure analysis: geometry-normal sampling raised recall but sharply reduced precision, likely because normal-direction residuals can aggregate adjacent-lane or road-edge texture under perspective and curve noise.
+  - Avoid repeating standalone normal-direction strip sampling or only tuning `strip_normal_alpha_init`, normal offsets, or gate initialization.
+  - Recent grad norms have intermittent finite spikes, including `893.2286` at `Iter [5560/10000]`, `761.4874` at `Iter [5780/10000]`, and `935.8562` at `Iter [6820/10000]`, but the latest checked sequence recovered to finite non-divergent values and loss did not show a sustained blow-up.
+- Previous failed score-improvement experiment:
+  - Selected idea: content-aware strip attention.
+  - Rationale: stable `strip_sample` uses one global softmax weight over offsets for every lane point. It improved precision but reduced recall, so this experiment keeps the successful local strip evidence path and lets each anchor point adaptively weight left/center/right features.
+  - Code: `mmseg/models/lane_detector/anchor_3dlane_pp.py` temporarily added optional `strip_agg='content'` with a zero-initialized `strip_score_layer`, so loading the stable `strip_sample` checkpoint started close to the previous global aggregation behavior.
+  - Config: `configs_v2/openlane/experiments/anchor3dlane++_r50x2_strip_content.py`.
+  - Code review subagent found no blocking OOM, tensor-shape, DDP unused-parameter, checkpoint-load, gradient, or training-interruption issue.
+  - Remote config/model build passed: `samples_per_gpu=3`, `strip_agg='content'`, `strip_score_layer.weight` shape `[1, 64]`, and zero initialization.
+  - Remote checkpoint load passed from `output/openlane/experiments/strip_sample_r50x2/iter_10000.pth`; only expected missing keys were `strip_score_layer.weight` and `strip_score_layer.bias`.
+  - Remote 2-GPU DDP 1-iteration and 20-iteration smoke passed with finite loss/grad, memory about 27.4GB, no OOM/Traceback/NaN/reduction error, and only a non-blocking `find_unused_parameters=True` performance warning.
+  - Smoke outputs were cleaned; obsolete `strip_sample` intermediate checkpoints were removed, keeping `iter_10000.pth`.
+  - Persistent OpenLane training image repair completed with `dirs=16`, `segments=798`, and `broken_symlinks=0`.
+  - Randomly checked 36 training-list entries against both image and `.pkl` annotation paths; no missing files were found.
+  - Formal 2-GPU training completed with PID file `logs/train_strip_content.pid`, log `logs/train_strip_content_20260510_151915.log`, `samples_per_gpu=3`, and work dir `output/openlane/experiments/strip_content_r50x2`.
+  - Formal validation evaluation completed with PID file `logs/eval_strip_content.pid`, log `logs/eval_strip_content_20260510_161629.log`, and result path `output/openlane/experiments/strip_content_r50x2_eval/evaluation_result.json`.
+  - Metrics: F1 `0.6235247637827419`, recall `0.6105797008409835`, precision `0.63703061970382`, category accuracy `0.9359335634972473`.
+  - Decision: regressed below current stable F1 `0.6252112086013109` and official baseline F1 `0.6240448139487519`; failed implementation code and config were rolled back, and the failure was documented in `docs/失败路线.md`.
+- Previous successful experiment:
   - Selected idea: projection-aware local lane-strip sampling.
   - Rationale: the original `Anchor3DLanePP` samples one image feature point per projected 3D anchor point. A small projection error can miss thin lane evidence, especially far away. This experiment samples three horizontal offsets around the projected point and learns a light softmax aggregation, while keeping loss, matcher, visibility supervision, and test thresholds unchanged.
   - Code: `mmseg/models/lane_detector/anchor_3dlane_pp.py` adds optional `strip_sample`, `strip_offsets`, `strip_center_bias`, and `strip_apply`.
@@ -85,12 +147,11 @@
   - OpenLane validation list has 39981 entries and cache has 39981 `.pkl` files.
   - Validation images are under `data/OpenLane/images/validation`.
   - OpenLane raw training image archives are about 88.7G; raw validation image archives are about 22.3G.
-  - `/root/autodl-tmp` is the only writable data mount and is 50G total. `/autodl-pub` is read-only and has no reusable OpenLane/ApolloSim dataset directory.
-  - Current OpenLane training image workaround uses `/dev/shm/openlane_train_images_a` for `images_training_0..10`, `/root/openlane_train_images_b` for `images_training_11..15`, and symlinks segments into `data/OpenLane/images/training`.
-  - OpenLane training image extraction is complete with 798 symlinked segment directories.
-  - OpenLane training cache/list generation completed with 136496 samples.
-  - Current preparation script: `/root/autodl-tmp/jobs/prepare_openlane_train_split.sh`; it must check `images_training_N/segment-*` per archive before skipping extraction, otherwise later archives can be skipped incorrectly.
-  - No dataset preparation job is currently running.
+  - `/root/autodl-tmp` is the only writable data mount and is now about 150G total. `/autodl-pub` is read-only and has no reusable OpenLane/ApolloSim dataset directory.
+  - Persistent OpenLane training images are under `/root/autodl-tmp/openlane_train_images`; the old `/dev/shm` path is not reliable.
+  - Preparation script `/root/autodl-tmp/jobs/prepare_openlane_train_parallel.sh` completed successfully and linked 798 training segment directories.
+  - OpenLane training cache/list generation completed; latest list count is 138264 samples.
+  - Current preparation scripts must check `images_training_N/segment-*` per archive before skipping extraction, otherwise later archives can be skipped incorrectly.
   - ApolloSim still needs a larger writable disk or an external mounted dataset path.
 
 ## Agent Workflow

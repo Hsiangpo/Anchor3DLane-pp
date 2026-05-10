@@ -33,6 +33,9 @@ class LaneLossV2(nn.Module):
                  anchor_assign=False,
                  delta = 0.2,
                  ds = 10,
+                 curve_geom_axes=('x',),
+                 curve_slope_weight=1.0,
+                 curve_curv_weight=0.4,
                  assign_cfg=None):
         super(LaneLossV2, self).__init__()
         self.focal_alpha = focal_alpha
@@ -47,10 +50,63 @@ class LaneLossV2(nn.Module):
         self.anchor_assign = anchor_assign
         self.lane_prior = 'reg_losses_prior' in loss_weights.keys()
         self.consist = ('consist_losses' in loss_weights.keys())
+        self.curve_geom = ('curve_geom_losses' in loss_weights.keys())
+        self.curve_geom_axes = tuple(curve_geom_axes)
+        assert len(self.anchor_steps) == self.anchor_len
+        assert set(self.curve_geom_axes).issubset({'x', 'z'})
+        self.curve_slope_weight = float(curve_slope_weight)
+        self.curve_curv_weight = float(curve_curv_weight)
+        self.register_buffer('anchor_y_steps_tensor',
+                             torch.as_tensor(anchor_steps, dtype=torch.float32),
+                             persistent=False)
         self.fp16_enabled = False
         self.delta = delta
         self.ds = ds
         self.assigner = HungarianMatcher(anchor_len=self.anchor_len, **assign_cfg)
+
+    def zero_loss(self, tensor):
+        return tensor.sum() * 0
+
+    def masked_smooth_l1(self, pred, target, mask):
+        loss = F.smooth_l1_loss(pred, target, reduction='none')
+        mask = mask.to(loss.dtype)
+        return (loss * mask).sum() / mask.sum().clamp_min(1.0)
+
+    def axis_curve_geom_loss(self, pred, target, vis):
+        zero = self.zero_loss(pred)
+        if pred.shape[1] < 2:
+            return zero
+
+        y_steps = self.anchor_y_steps_tensor.to(device=pred.device, dtype=pred.dtype)
+        dy = (y_steps[1:] - y_steps[:-1]).clamp_min(1e-6)
+        pred_slope = (pred[:, 1:] - pred[:, :-1]) / dy.view(1, -1)
+        target_slope = (target[:, 1:] - target[:, :-1]) / dy.view(1, -1)
+        slope_mask = (vis[:, 1:] > 0.5) & (vis[:, :-1] > 0.5)
+
+        total = zero
+        if self.curve_slope_weight > 0:
+            total = total + self.curve_slope_weight * self.masked_smooth_l1(
+                pred_slope, target_slope, slope_mask)
+
+        if self.curve_curv_weight > 0 and pred.shape[1] >= 3:
+            mid_dy = ((dy[1:] + dy[:-1]) * 0.5).clamp_min(1e-6)
+            pred_curv = (pred_slope[:, 1:] - pred_slope[:, :-1]) / mid_dy.view(1, -1)
+            target_curv = (target_slope[:, 1:] - target_slope[:, :-1]) / mid_dy.view(1, -1)
+            curv_mask = slope_mask[:, 1:] & slope_mask[:, :-1]
+            total = total + self.curve_curv_weight * self.masked_smooth_l1(
+                pred_curv, target_curv, curv_mask)
+
+        return total
+
+    def curve_geom_loss(self, x_pred, z_pred, x_target, z_target, vis_target):
+        losses = []
+        if 'x' in self.curve_geom_axes:
+            losses.append(self.axis_curve_geom_loss(x_pred, x_target, vis_target))
+        if 'z' in self.curve_geom_axes:
+            losses.append(self.axis_curve_geom_loss(z_pred, z_target, vis_target))
+        if not losses:
+            return self.zero_loss(x_pred)
+        return sum(losses) / len(losses)
         
     def forward(self, proposals_list, targets):
         if self.use_sigmoid:
@@ -66,6 +122,8 @@ class LaneLossV2(nn.Module):
             reg_losses_prior = 0
         if self.consist:
             consist_losses = 0 
+        if self.curve_geom:
+            curve_geom_losses = 0
         valid_imgs = len(targets)
         total_positives = 0
         total_negatives = 0
@@ -88,6 +146,8 @@ class LaneLossV2(nn.Module):
                     reg_losses_prior += smooth_l1_loss(cls_pred, cls_pred).sum() * 0
                 if self.consist:
                     consist_losses += smooth_l1_loss(cls_pred, cls_pred).sum() * 0
+                if self.curve_geom:
+                    curve_geom_losses += self.zero_loss(cls_pred)
                 continue
             # Gradients are also not necessary for the positive & negative matching
             x_indices = torch.tensor(self.anchor_steps).to(torch.long).to(target.device) + 5
@@ -125,6 +185,8 @@ class LaneLossV2(nn.Module):
                     reg_losses_prior += smooth_l1_loss(cls_pred, cls_pred).sum() * 0
                 if self.consist:
                     consist_losses += smooth_l1_loss(cls_pred, cls_pred).sum() * 0
+                if self.curve_geom:
+                    curve_geom_losses += self.zero_loss(cls_pred)
                 continue
 
             # Get classification targets
@@ -173,6 +235,9 @@ class LaneLossV2(nn.Module):
                 consist_loss = (distance_delta * distance_mask).sum(-1) / (distance_mask.sum(-1) + 1e-6)
                 consist_loss = consist_loss.triu(diagonal=1)
                 consist_losses += consist_loss.sum() / (num_positives * (num_positives - 1) / 2 + 1e-6)
+            if self.curve_geom:
+                curve_geom_losses += self.curve_geom_loss(
+                    x_pred, z_pred, x_target, z_target, vis_target)
             
             if self.use_sigmoid:
                 cls_losses += cls_loss.sum() / num_positives / num_clses
@@ -194,6 +259,9 @@ class LaneLossV2(nn.Module):
         if self.consist:
             consist_losses = consist_losses / valid_imgs
             losses['consist_losses'] = consist_losses
+        if self.curve_geom:
+            curve_geom_losses = curve_geom_losses / valid_imgs
+            losses['curve_geom_losses'] = curve_geom_losses
 
         for k in losses.keys():
             losses[k] = losses[k] * self.loss_weights[k]

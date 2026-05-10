@@ -72,6 +72,10 @@ class Anchor3DLanePP(BaseModule):
                  num_category = 21,
                  expert_idx = -1,
                  use_sigmoid=False,
+                 strip_sample=False,
+                 strip_offsets=(-1., 0., 1.),
+                 strip_center_bias=2.0,
+                 strip_apply='all',
                  loss_lane = None,
                  loss_aux = None,
                  init_cfg = None,
@@ -97,6 +101,17 @@ class Anchor3DLanePP(BaseModule):
         self.fp16_enabled = False
         self.with_pos = with_pos
         self.expert_idx = expert_idx
+        self.strip_sample = strip_sample
+        self.strip_offsets = tuple(float(offset) for offset in strip_offsets)
+        self.strip_center_bias = strip_center_bias
+        self.strip_apply = strip_apply
+        if self.strip_sample:
+            assert len(self.strip_offsets) > 0
+            self.strip_weight_logits = nn.Parameter(torch.zeros(len(self.strip_offsets)))
+            center_idx = min(range(len(self.strip_offsets)), key=lambda idx: abs(self.strip_offsets[idx]))
+            self.strip_weight_logits.data[center_idx] = strip_center_bias
+        else:
+            self.register_parameter('strip_weight_logits', None)
 
         # Anchor
         self.y_steps = np.array(y_steps, dtype=np.float32)
@@ -233,7 +248,35 @@ class Anchor3DLanePP(BaseModule):
         v_vals = trans[:, 1, :] / trans[:, 2, :]   # [B, NCl]
         return u_vals, v_vals
 
-    def cut_anchor_features(self, features, h_g2feats, xs, ys, zs, anchor_feat_len, feat_size):
+    def use_strip_sample(self, feat_idx, iter_idx):
+        if not self.strip_sample:
+            return False
+        if self.strip_apply == 'all':
+            return True
+        if self.strip_apply == 'final':
+            return feat_idx == self.feat_num - 1 and iter_idx == self.iter_reg - 1
+        raise ValueError(f'Unsupported strip_apply: {self.strip_apply}')
+
+    def strip_grid_sample(self, features, batch_us, batch_vs, batch_size, anchor_feat_len, feat_size, use_strip):
+        if not use_strip:
+            batch_grid = torch.stack([batch_us, batch_vs], dim=-1)
+            batch_grid = batch_grid.reshape(batch_size, -1, anchor_feat_len, 2)
+            return F.grid_sample(features, batch_grid, padding_mode='zeros')
+
+        num_offsets = len(self.strip_offsets)
+        num_anchors = batch_us.shape[1] // anchor_feat_len
+        offsets = features.new_tensor(self.strip_offsets).view(1, 1, num_offsets)
+        offset_step = 2.0 / max(float(feat_size[1]), 1.0)
+        strip_us = batch_us.unsqueeze(-1) + offsets * offset_step
+        strip_vs = batch_vs.unsqueeze(-1).expand_as(strip_us)
+        strip_grid = torch.stack([strip_us, strip_vs], dim=-1)
+        strip_features = F.grid_sample(features, strip_grid, padding_mode='zeros')
+        strip_features = strip_features.reshape(batch_size, features.shape[1], num_anchors,
+                                                anchor_feat_len, num_offsets)
+        strip_weights = self.strip_weight_logits.softmax(0).to(strip_features.dtype)
+        return (strip_features * strip_weights.view(1, 1, 1, 1, num_offsets)).sum(-1)
+
+    def cut_anchor_features(self, features, h_g2feats, xs, ys, zs, anchor_feat_len, feat_size, use_strip):
         # definitions
         batch_size = features.shape[0]
 
@@ -250,9 +293,8 @@ class Anchor3DLanePP(BaseModule):
         batch_us = (batch_us / feat_size[1] - 0.5) * 2
         batch_vs = (batch_vs / feat_size[0] - 0.5) * 2
 
-        batch_grid = torch.stack([batch_us, batch_vs], dim=-1)  #
-        batch_grid = batch_grid.reshape(batch_size, -1, anchor_feat_len, 2)  # [B, N, l, 2]
-        batch_anchor_features = F.grid_sample(features, batch_grid, padding_mode='zeros')   # [B, C, N, l]
+        batch_anchor_features = self.strip_grid_sample(
+            features, batch_us, batch_vs, batch_size, anchor_feat_len, feat_size, use_strip)
 
         valid_mask = (batch_us > -1) & (batch_us < 1) & (batch_vs > -1) & (batch_vs < 1)
 
@@ -267,74 +309,6 @@ class Anchor3DLanePP(BaseModule):
         if self.neck_aux is not None:
             output = self.neck_aux(output)
         return output
-
-    @force_fp32()
-    def get_proposals(self, project_matrixes, anchor_feat, feat_idx, proposals_prev, feat_size, iter_idx, reg_prior=False):
-        batch_size = project_matrixes.shape[0]
-        xs, ys, zs = self.compute_anchor_cut_indices(proposals_prev, self.feat_y_steps)
-        batch_anchor_features, _ = self.cut_anchor_features(anchor_feat, project_matrixes, xs, ys, zs, self.anchor_feat_len, feat_size)   # [B, C, N, l]
-
-        if self.with_pos != 'none':
-            xs = xs / self.x_norm # [B, N*L]
-            ys = ys / self.y_norm
-            zs = zs / self.z_norm
-            xyz = torch.stack([xs, ys, zs], -1)  # [B, NL, 3]
-            batch_pos_features = self.position_encoder(xyz)  # [B, NL, C]
-            batch_pos_features = batch_pos_features.transpose(1, 2).reshape(batch_size, self.anchor_feat_channels, self.anchor_num, self.anchor_feat_len)
-            if self.with_pos == 'add':
-                batch_anchor_features = batch_anchor_features + batch_pos_features
-            elif self.with_pos == 'pcat':
-                batch_anchor_features = torch.cat([batch_anchor_features, batch_pos_features], 1)  # [B, C, N, l]
-                batch_anchor_features = batch_anchor_features.permute(0, 2, 3, 1) # [B, N, l, C]
-                batch_anchor_features = self.fuse_pos[f'layer_{feat_idx}'][iter_idx](batch_anchor_features)
-                batch_anchor_features = batch_anchor_features.permute(0, 3, 1, 2)  # [B, C, N, l]
-            else:
-                batch_anchor_features = torch.cat([batch_anchor_features, batch_pos_features], 1)
-
-        batch_anchor_features = batch_anchor_features.transpose(1, 2)  # [B, N, C, l]
-        batch_anchor_features = batch_anchor_features.flatten(2, 3)  # [B, N, C*l]
-        batch_anchor_features = self.dynamic_head[f'layer_{feat_idx}'][iter_idx](batch_anchor_features) # [B, N, Cl]
-        batch_anchor_features = batch_anchor_features.flatten(0, 1)  # [B*N, C*l]
-
-        # Predict
-        cls_logits = self.cls_layer[f'layer_{feat_idx}'][iter_idx](batch_anchor_features)   # [B * N, C]
-        cls_logits = cls_logits.reshape(batch_size, -1, cls_logits.shape[1])   # [B, N, C]
-        reg_x = self.reg_x_layer[f'layer_{feat_idx}'][iter_idx](batch_anchor_features)    # [B * N, l]  
-        reg_x = reg_x.reshape(batch_size, -1, reg_x.shape[1])   # [B, N, l]
-        reg_z = self.reg_z_layer[f'layer_{feat_idx}'][iter_idx](batch_anchor_features)    # [B * N, l]  # tanh
-        reg_z = reg_z.reshape(batch_size, -1, reg_z.shape[1])   # [B, N, l]
-        reg_vis = self.reg_vis_layer[f'layer_{feat_idx}'][iter_idx](batch_anchor_features)  # [B * N, l]
-        reg_vis = torch.sigmoid(reg_vis)
-        reg_vis = reg_vis.reshape(batch_size, -1, reg_vis.shape[1])   # [B, N, l]
-
-        # lane prior regression
-        if reg_prior:
-            reg_lane_priors = self.reg_prior_layer[iter_idx](batch_anchor_features)   # [B * N, 3]
-            reg_lane_priors = reg_lane_priors.reshape(batch_size, -1, 3)   # [B, N, C]
-            reg_lane_priors = torch.tanh(reg_lane_priors) # / 30.  # yaws, pitch, xs, [-1, 1]
-            
-            # Add offsets to anchors
-            # [B, N, l]
-            lane_priors = reg_lane_priors + proposals_prev[..., 2:5]
-            cur_anchors = self.anchor_generator.generate_anchors_batch(lane_priors[:, :, 2], lane_priors[:, :, 0], lane_priors[:, :, 1])
-            reg_proposals = torch.zeros(batch_size, self.anchor_num, 5 + self.anchor_len * 3 + self.num_category, device = project_matrixes.device)
-            reg_proposals[:, :, :5+self.anchor_len*3] = reg_proposals[:, :, :5+self.anchor_len*3] + cur_anchors[:, :, :5+self.anchor_len*3]
-        else:
-            # Add offsets to anchors
-            # [B, N, l]
-            reg_proposals = torch.zeros(batch_size, self.anchor_num, 5 + self.anchor_len * 3 + self.num_category, device = project_matrixes.device)
-            reg_proposals[:, :, :5+self.anchor_len*3] = reg_proposals[:, :, :5+self.anchor_len*3] + proposals_prev[:, :, :5+self.anchor_len*3]
-        
-        reg_proposals[:, :, 5:5+self.anchor_len] += reg_x
-        reg_proposals[:, :, 5+self.anchor_len:5+self.anchor_len*2] += reg_z
-        reg_proposals[:, :, 5+self.anchor_len*2:5+self.anchor_len*3] = reg_vis
-        reg_proposals[:, :, 5+self.anchor_len*3:5+self.anchor_len*3+self.num_category] = cls_logits   # [B, N, C]
-
-        if reg_prior:
-            return reg_proposals, cur_anchors
-        else:
-            return reg_proposals, None
-
 
     def encoder_decoder(self, img, mask, gt_project_matrix, **kwargs):
         # img: [B, 3, inp_h, inp_w]; mask: [B, 1, 36, 480]
@@ -458,7 +432,9 @@ class Anchor3DLanePP(BaseModule):
     def get_proposals(self, project_matrixes, anchor_feat, feat_idx, proposals_prev, feat_size, iter_idx, reg_prior=False):
         batch_size = project_matrixes.shape[0]
         xs, ys, zs = self.compute_anchor_cut_indices(proposals_prev, self.feat_y_steps)
-        batch_anchor_features, _ = self.cut_anchor_features(anchor_feat, project_matrixes, xs, ys, zs, self.anchor_feat_len, feat_size)   # [B, C, N, l]
+        use_strip = self.use_strip_sample(feat_idx, iter_idx)
+        batch_anchor_features, _ = self.cut_anchor_features(
+            anchor_feat, project_matrixes, xs, ys, zs, self.anchor_feat_len, feat_size, use_strip)   # [B, C, N, l]
 
         if self.with_pos != 'none':
             xs = xs / self.x_norm # [B, N*L]

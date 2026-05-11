@@ -1,4 +1,4 @@
-[系统状态]：Anchor3DLane-pp is deployed and the official checkpoint baseline is reproduced on OpenLane validation, current stable F1 = 62.550; latest successful experiment is `eac_dr`; latest failed experiment is `dags`; current running experiment is none; ApolloSim is not mounted yet.
+[系统状态]：Anchor3DLane-pp is deployed and the official checkpoint baseline is reproduced on OpenLane validation, current stable F1 = 62.555; latest successful experiment is `frt_eat`; latest failed experiment is `pcaug_eac`; current running experiment is none; ApolloSim is not mounted yet.
 
 # Anchor3DLane-pp Agent Notes
 
@@ -35,12 +35,30 @@
   - Result file: `/root/autodl-tmp/Anchor3DLane-pp/output/openlane/baseline_eval/evaluation_result.json`
   - Metrics: F1 `0.6240448139487519`, recall `0.613268850798542`, precision `0.6352062468171787`, category accuracy `0.9337897428296154`.
 - Current stable score:
-  - Experiment: `strip_sample + vdcc + eac_dr` / evaluator-acceptance calibrated duplicate reranking.
-  - Result file: `/root/autodl-tmp/Anchor3DLane-pp/output/openlane/experiments/eac_dr_r50x2_eval/evaluation_result.json`.
-  - Metrics: F1 `0.625498769106239`, recall `0.6162575877540248`, precision `0.6350213248393889`, category accuracy `0.93595710615482`.
-  - Improvement over previous stable `strip_sample + vdcc`: `+0.00007269750831218058` F1, or `+0.007270` points on the 0-100 reporting scale.
-  - Improvement over official checkpoint baseline: `+0.0014539551574871412` F1, or `+0.145396` points on the 0-100 reporting scale.
+  - Experiment: `strip_sample + vdcc + eac_dr + frt_eat` / Frenet road-ribbon topology with evaluator-aware training.
+  - Result file: `/root/autodl-tmp/Anchor3DLane-pp/output/openlane/experiments/frt_eat_r50x2_eval/evaluation_result.json`.
+  - Metrics: F1 `0.6255466703380164`, recall `0.6164715784668279`, precision `0.634892943535696`, category accuracy `0.9358638012838404`.
+  - Improvement over previous stable `strip_sample + vdcc + eac_dr`: `+0.000047901231777336406` F1, or `+0.004790` points on the 0-100 reporting scale.
+  - Improvement over official checkpoint baseline: `+0.0015018563892644776` F1, or `+0.150186` points on the 0-100 reporting scale.
 - Latest successful score-improvement experiment:
+  - Selected idea: FRT-EAT / Frenet Road-Ribbon Topology with Evaluator-Aware Training.
+  - Rationale: PC-Aug raised precision while collapsing recall, so this round protects EAC-DR's precision/recall balance instead of changing the image distribution. FRT-EAT keeps the 30-proposal geometry, matcher, NMS, and thresholds unchanged; it only changes the final evaluator-aware calibration target by using GT lane-local road ribbons to ignore or down-rank proposals that are evaluator-close but topologically crossing into a neighboring lane ribbon.
+  - Code: `mmseg/models/losses/lane_loss_v2.py` adds optional `frt_enable`, GT-derived ribbon width, neighbor-gated ribbon violation logic inside `LaneLossV2.acceptance_labels`, and `batch_frt_dirty` logging; config is `configs_v2/openlane/experiments/anchor3dlane++_r50x2_frt_eat.py`.
+  - Checkpoint source: `output/openlane/experiments/eac_dr_r50x2/iter_10000.pth`.
+  - Validation gates passed:
+    - Local and remote `py_compile` and `git diff --check` passed.
+    - Remote config/model/checkpoint load passed; only six `accept_calib_head.*` parameters are trainable.
+    - Remote synthetic sanity passed: exact-GT proposals are accepted, cross-neighbor evaluator-positive proposals become ignored FRT dirty samples, and single-lane cases are not penalized.
+    - Code review subagent found no blocking OOM, DDP, tensor-shape, checkpoint-load, gradient, or failed-route issue.
+    - Remote 2-GPU DDP smoke passed; memory about `18974MB`, `batch_frt_dirty` was nonzero, losses and grad norm stayed finite, and there was no OOM/NaN/Traceback/Killed/DDP hard error.
+  - Formal training and validation completed:
+    - Training log: `logs/train_frt_eat_20260512_053600.log`.
+    - Final checkpoint: `output/openlane/experiments/frt_eat_r50x2/iter_8000.pth`.
+    - Evaluation log: `logs/eval_frt_eat_20260512_055533.log`.
+    - Result file: `output/openlane/experiments/frt_eat_r50x2_eval/evaluation_result.json`.
+    - Metrics: F1 `0.6255466703380164`, recall `0.6164715784668279`, precision `0.634892943535696`, category accuracy `0.9358638012838404`.
+  - Decision: FRT-EAT improves over previous stable EAC-DR F1 `0.625498769106239` and official baseline F1 `0.6240448139487519`; keep the implementation, record it in `docs/实验记录.md`, and commit/push this stable version. The minimum target F1 > 65 is still not reached.
+- Previous successful score-improvement experiment:
   - Selected idea: EAC-DR / Evaluator-Acceptance Calibrated Duplicate Reranker.
   - Rationale: recent geometry and candidate-generation routes mostly disturbed the current V-DCC precision/recall balance. EAC-DR keeps the 30-proposal geometry, matcher, and candidate count unchanged, freezes the stable V-DCC base, and trains only a final-layer evaluator-acceptance calibration head to rerank existing candidates with an OpenLane-style 1.5m / 75% acceptance label and duplicate ordering loss.
   - Code: `mmseg/models/lane_detector/anchor_3dlane_pp.py` adds optional final-only `accept_calib_head`, frozen-base train-mode handling, and weak calibrated NMS/output scores; `mmseg/models/losses/lane_loss_v2.py` adds optional `accept_calib_losses` and `dup_rank_losses`; `mmseg/apis/test_openlane.py` consumes optional calibrated scores; config is `configs_v2/openlane/experiments/anchor3dlane++_r50x2_eac_dr.py`.
@@ -62,6 +80,32 @@
     - Metrics: F1 `0.625498769106239`, recall `0.6162575877540248`, precision `0.6350213248393889`, category accuracy `0.93595710615482`.
   - Decision: EAC-DR improves over the previous stable F1 `0.6254260715979268` and official baseline F1 `0.6240448139487519`; keep the implementation, record it in `docs/实验记录.md`, and commit/push this stable version. The minimum target F1 > 65 is still not reached.
 - Latest failed score-improvement experiment:
+  - Selected idea: PC-Aug / Projection-Consistent Camera Augmented Fine-tuning.
+  - Rationale: previous structural attempts mostly disturbed precision/recall or added weak geometry priors. PC-Aug instead changes the training distribution while preserving exact 3D-to-image supervision: it applies small image-space affine perturbations before resize and left-multiplies `gt_project_matrix` / `gt_homography_matrix` by the same 2D transform, then fine-tunes the current EAC-DR model at low LR. This is a data-generalization route, not a new candidate, NMS, temporal, BEV, graph, topology, or threshold route.
+  - Code: `mmseg/datasets/pipelines/lane_aug/projective.py` temporarily added `ProjectiveCameraAug`; `mmseg/datasets/pipelines/__init__.py` temporarily exported it; config was `configs_v2/openlane/experiments/anchor3dlane++_r50x2_pcaug_eac.py`. Failed code and config are rolled back.
+  - Checkpoint source: `output/openlane/experiments/eac_dr_r50x2/iter_10000.pth`.
+  - Validation gates passed:
+    - Local and remote `py_compile` and `git diff --check` passed.
+    - Remote dataset sanity passed: for real OpenLane samples, augmented `gt_project_matrix` equals `H_aug @ original_project_matrix`, full pipeline returns `img=(3,720,960)`, `gt_project_matrix=(1,3,4)`, and no valid lane has fewer than two visible points after visibility update.
+    - Remote config/model/checkpoint load passed with zero missing and unexpected keys; `freeze_base=False` is intentional, so PC-Aug is full-model low-LR fine-tuning rather than EAC-head-only training.
+    - Code review subagent cleared the previous high-risk visibility-label issue after `update_visibility()` was added and low-visible lanes are invalidated.
+    - Remote 2-GPU DDP smoke passed:
+      - 1-iter smoke completed and wrote a checkpoint, with no OOM/NaN/Traceback/Killed/DDP hard error.
+      - 20-iter smoke completed with memory about `27398MB`, finite losses, finite grad norm, and no OOM/NaN/Traceback/Killed/DDP hard error.
+  - Formal training and validation completed:
+    - Training log: `logs/train_pcaug_eac_20260512_033447.log`.
+    - Final checkpoint: `output/openlane/experiments/pcaug_eac_r50x2/iter_15000.pth`.
+    - Evaluation log: `logs/eval_pcaug_eac_20260512_050000.log`.
+    - Result file: `output/openlane/experiments/pcaug_eac_r50x2_eval/evaluation_result.json`.
+    - Metrics: F1 `0.625321996136235`, recall `0.5778319887583545`, precision `0.6813170846878916`, category accuracy `0.9340488207591422`.
+  - Decision: PC-Aug improved precision but collapsed recall and regressed below current stable EAC-DR F1 `0.625498769106239`; failed implementation code and config are rolled back, and the failure is documented in `docs/失败路线.md`.
+  - Avoid repeating projection-consistent camera affine augmentation as a full-model fine-tuning route or only tuning `prob`, rotation/scale/translation/shear ranges, `min_visible_ratio`, learning rate, or iteration count.
+  - Formal training setup:
+    - Config: `configs_v2/openlane/experiments/anchor3dlane++_r50x2_pcaug_eac.py`.
+    - Work dir: `output/openlane/experiments/pcaug_eac_r50x2`.
+    - `samples_per_gpu=3`, `lr=5e-6`, `max_iters=15000`, `checkpoint_config.max_keep_ckpts=1`.
+    - Decision threshold: keep only if validation F1 exceeds current stable `0.625498769106239`.
+- Previous failed score-improvement experiment:
   - Selected idea: DAGS / Depth-Aware Grade-State Anchor.
   - Rationale: previous pseudo-BEV, auxiliary depth, full-image road-surface, deformable sampling, temporal memory, and lane-set graph routes did not create evaluator-aligned 3D gains. DAGS keeps the 30-proposal path unchanged but injects a lane-local low-dimensional z/grade state directly into the anchor geometry before refinement.
   - Code: `mmseg/models/lane_detector/anchor_3dlane_pp.py` temporarily added optional `depth_grade_state` with low-dimensional z/grade deltas injected into anchor z slots before refinement; `mmseg/models/losses/lane_loss_v2.py` temporarily added optional `depth_state_losses`; config was `configs_v2/openlane/experiments/anchor3dlane++_r50x2_dags.py`. Failed code and config must stay rolled back.

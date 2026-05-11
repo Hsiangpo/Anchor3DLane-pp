@@ -47,6 +47,13 @@ class LaneLossV2(nn.Module):
                  accept_neg_weight=1.0,
                  dup_rank_margin=0.1,
                  dup_rank_max_pairs=4,
+                 frt_enable=False,
+                 frt_min_width=0.6,
+                 frt_default_width=2.0,
+                 frt_max_width=2.5,
+                 frt_slack=0.15,
+                 frt_dirty_thresh=0.10,
+                 frt_rank_weight=0.25,
                  assign_cfg=None):
         super(LaneLossV2, self).__init__()
         self.focal_alpha = focal_alpha
@@ -80,6 +87,13 @@ class LaneLossV2(nn.Module):
         self.accept_neg_weight = float(accept_neg_weight)
         self.dup_rank_margin = float(dup_rank_margin)
         self.dup_rank_max_pairs = int(dup_rank_max_pairs)
+        self.frt_enable = bool(frt_enable)
+        self.frt_min_width = float(frt_min_width)
+        self.frt_default_width = float(frt_default_width)
+        self.frt_max_width = float(frt_max_width)
+        self.frt_slack = float(frt_slack)
+        self.frt_dirty_thresh = float(frt_dirty_thresh)
+        self.frt_rank_weight = float(frt_rank_weight)
         self.register_buffer('anchor_y_steps_tensor',
                              torch.as_tensor(anchor_steps, dtype=torch.float32),
                              persistent=False)
@@ -144,6 +158,38 @@ class LaneLossV2(nn.Module):
         flag_r = visible.flip(dims=[1]).cumsum(dim=1).flip(dims=[1])
         return (flag_l > 0) & (flag_r > 0)
 
+    def build_ribbon_widths(self, x_target, vis_target):
+        target_count, step_count = x_target.shape
+        widths = x_target.new_full(x_target.shape, self.frt_default_width)
+        has_neighbor = torch.zeros(x_target.shape, dtype=torch.bool, device=x_target.device)
+        if target_count < 2:
+            return widths.clamp(self.frt_min_width, self.frt_max_width), has_neighbor
+
+        for step_idx in range(step_count):
+            step_vis = vis_target[:, step_idx]
+            if int(step_vis.sum().item()) < 2:
+                continue
+            step_x = x_target[:, step_idx]
+            gap = (step_x[:, None] - step_x[None, :]).abs()
+            invalid = (~step_vis[:, None]) | (~step_vis[None, :])
+            gap = gap.masked_fill(invalid, 1e6)
+            gap.fill_diagonal_(1e6)
+            nearest = gap.min(dim=1)[0]
+            reliable = step_vis & (nearest < 1e5)
+            widths[reliable, step_idx] = nearest[reliable] * 0.5
+            has_neighbor[reliable, step_idx] = True
+        return widths.clamp(self.frt_min_width, self.frt_max_width), has_neighbor
+
+    def ribbon_pair_violation(self, x_pred, pred_mask, x_target, vis_target):
+        if x_target.shape[0] == 0:
+            return x_pred.new_zeros((x_pred.shape[0], 0))
+        widths, has_neighbor = self.build_ribbon_widths(x_target, vis_target)
+        pair_mask = pred_mask[:, None, :] & vis_target[None, :, :] & has_neighbor[None, :, :]
+        excess = (x_pred[:, None, :] - x_target[None, :, :]).abs()
+        excess = F.relu(excess - widths[None, :, :] - self.frt_slack)
+        denom = pair_mask.to(excess.dtype).sum(dim=2).clamp_min(1.0)
+        return (excess * pair_mask.to(excess.dtype)).sum(dim=2) / denom
+
     def acceptance_labels(self, proposals, target):
         num_props = proposals.shape[0]
         device = proposals.device
@@ -157,7 +203,7 @@ class LaneLossV2(nn.Module):
         if target.shape[0] == 0:
             hard_neg = base_scores > self.accept_hard_score_thresh
             valid[hard_neg] = True
-            return labels, valid, accepted, best_target, best_cost
+            return labels, valid, accepted, best_target, best_cost, labels.new_tensor(0.)
 
         x_pred = proposals[:, 5:5+self.anchor_len]
         z_pred = proposals[:, 5+self.anchor_len:5+self.anchor_len*2]
@@ -177,11 +223,23 @@ class LaneLossV2(nn.Module):
         cover = hit_count / gt_visible.view(1, -1)
         purity = hit_count / pred_visible.view(-1, 1)
         pair_accept = (cover >= self.accept_cover_thresh) & (purity >= self.accept_purity_thresh)
+        if self.frt_enable:
+            ribbon_violation = self.ribbon_pair_violation(
+                x_pred, pred_mask, x_target, vis_target)
+            pair_clean = ribbon_violation <= self.frt_dirty_thresh
+            pair_accept_clean = pair_accept & pair_clean
+            frt_dirty = (pair_accept & ~pair_clean).any(dim=1)
+        else:
+            ribbon_violation = dist.new_zeros(pair_accept.shape)
+            pair_accept_clean = pair_accept
+            frt_dirty = torch.zeros(num_props, dtype=torch.bool, device=device)
 
         hit_cost = (dist * hit.to(dist.dtype)).sum(dim=2) / hit_count.clamp_min(1.0)
-        pair_cost = torch.where(pair_accept, hit_cost, dist.new_full(hit_cost.shape, 1e6))
+        if self.frt_enable:
+            hit_cost = hit_cost + self.frt_rank_weight * ribbon_violation
+        pair_cost = torch.where(pair_accept_clean, hit_cost, dist.new_full(hit_cost.shape, 1e6))
         min_cost, min_idx = pair_cost.min(dim=1)
-        accepted = pair_accept.any(dim=1)
+        accepted = pair_accept_clean.any(dim=1)
         labels[accepted] = 1.
         valid[accepted] = True
         best_target[accepted] = min_idx[accepted]
@@ -193,7 +251,8 @@ class LaneLossV2(nn.Module):
                     (max_cover < self.accept_neg_cover_thresh) &
                     (max_purity < self.accept_neg_purity_thresh))
         valid[hard_neg] = True
-        return labels, valid, accepted, best_target, best_cost
+        dirty_count = (frt_dirty & ~accepted).to(labels.dtype).sum()
+        return labels, valid, accepted, best_target, best_cost, dirty_count
 
     def duplicate_rank_loss(self, accept_logit, accepted, best_target, best_cost, target_count):
         rank_losses = []
@@ -217,11 +276,11 @@ class LaneLossV2(nn.Module):
     def accept_calibration_loss(self, proposals, target, accept_logit):
         if accept_logit is None:
             zero = self.zero_loss(proposals)
-            return zero, zero, zero, zero, zero, zero
+            return zero, zero, zero, zero, zero, zero, zero
 
         accept_logit = accept_logit.reshape(-1)
         with torch.no_grad():
-            labels, valid, accepted, best_target, best_cost = self.acceptance_labels(
+            labels, valid, accepted, best_target, best_cost, frt_dirty = self.acceptance_labels(
                 proposals.detach(), target.detach())
         if bool(valid.any()):
             weights = torch.where(labels[valid] > 0.5,
@@ -243,16 +302,17 @@ class LaneLossV2(nn.Module):
         pos_count = accepted.to(accept_logit.dtype).sum()
         neg_count = (valid & ~accepted).to(accept_logit.dtype).sum()
         ignore_count = (~valid).to(accept_logit.dtype).sum()
-        return accept_loss, rank_loss, pos_count, neg_count, ignore_count, rank_pairs
+        return accept_loss, rank_loss, pos_count, neg_count, ignore_count, rank_pairs, frt_dirty
 
     def init_accept_stats(self, proposals):
         zero = proposals.new_tensor(0.)
-        return dict(loss=zero, rank_loss=zero, pos=zero, neg=zero, ignore=zero, rank_pairs=zero)
+        return dict(loss=zero, rank_loss=zero, pos=zero, neg=zero,
+                    ignore=zero, rank_pairs=zero, frt_dirty=zero)
 
     def update_accept_stats(self, stats, proposals, target, accept_logit):
         if stats is None:
             return
-        accept_loss, rank_loss, pos_count, neg_count, ignore_count, rank_pairs = \
+        accept_loss, rank_loss, pos_count, neg_count, ignore_count, rank_pairs, frt_dirty = \
             self.accept_calibration_loss(proposals, target, accept_logit)
         stats['loss'] = stats['loss'] + accept_loss
         stats['rank_loss'] = stats['rank_loss'] + rank_loss
@@ -260,6 +320,7 @@ class LaneLossV2(nn.Module):
         stats['neg'] = stats['neg'] + neg_count
         stats['ignore'] = stats['ignore'] + ignore_count
         stats['rank_pairs'] = stats['rank_pairs'] + rank_pairs
+        stats['frt_dirty'] = stats['frt_dirty'] + frt_dirty
         
     def forward(self, proposals_list, targets):
         if self.use_sigmoid:
@@ -438,4 +499,6 @@ class LaneLossV2(nn.Module):
             result['batch_accept_ignore'] = accept_stats['ignore'] / bs
         if self.dup_rank:
             result['batch_dup_rank_pairs'] = accept_stats['rank_pairs'] / bs
+        if self.accept_calib and self.frt_enable:
+            result['batch_frt_dirty'] = accept_stats['frt_dirty'] / bs
         return result

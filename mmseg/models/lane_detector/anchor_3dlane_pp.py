@@ -76,6 +76,7 @@ class Anchor3DLanePP(BaseModule):
                  strip_offsets=(-1., 0., 1.),
                  strip_center_bias=2.0,
                  strip_apply='all',
+                 accept_calib=None,
                  loss_lane = None,
                  loss_aux = None,
                  init_cfg = None,
@@ -105,6 +106,7 @@ class Anchor3DLanePP(BaseModule):
         self.strip_offsets = tuple(float(offset) for offset in strip_offsets)
         self.strip_center_bias = strip_center_bias
         self.strip_apply = strip_apply
+        self.accept_calib_cfg = accept_calib
         if self.strip_sample:
             assert len(self.strip_offsets) > 0
             self.strip_weight_logits = nn.Parameter(torch.zeros(len(self.strip_offsets)))
@@ -185,6 +187,7 @@ class Anchor3DLanePP(BaseModule):
             self.anchor_feat_channels, 3, bias=False) for i in range(self.iter_reg)])
         self.expert_layer = ExpertDecode(self.anchor_feat_channels * self.feat_sizes[-1][1], self.anchor_num * self.x_num, \
                                           self.anchor_num * self.yaw_num, self.anchor_num * self.pitch_num, self.anchor_num)
+        self.build_accept_calib(accept_calib)
         for i in range(self.iter_reg):
             nn.init.zeros_(self.reg_prior_layer[i].layer[-1].weight.data)
 
@@ -199,6 +202,55 @@ class Anchor3DLanePP(BaseModule):
                     for ridx in range(len(loss_lane[idx])):
                         loss_lane[idx][ridx]['use_sigmoid'] = True
                 self.lane_loss[f'loss_{idx}'] = [build_loss(l) for l in loss_lane[idx]]
+        if getattr(self, 'accept_calib_freeze_base', False):
+            self.freeze_base_for_accept_calib()
+
+    def build_accept_calib(self, accept_calib):
+        self.accept_calib = False
+        self.accept_calib_freeze_base = False
+        if accept_calib is None:
+            return
+        cfg = accept_calib.copy()
+        if not cfg.pop('enabled', True):
+            return
+        self.accept_calib = True
+        self.accept_calib_apply = cfg.pop('apply', 'final')
+        self.accept_calib_detach = bool(cfg.pop('detach', True))
+        self.accept_calib_freeze_base = bool(cfg.pop('freeze_base', False))
+        self.accept_score_floor = float(cfg.pop('score_floor', 0.75))
+        self.accept_nms_power = float(cfg.pop('nms_power', 1.0))
+        bias_init = float(cfg.pop('bias_init', 4.0))
+        hidden = int(cfg.pop('hidden_channels', self.anchor_feat_channels))
+        if cfg:
+            raise ValueError(f'Unsupported accept_calib options: {sorted(cfg.keys())}')
+        self.accept_calib_head = DecodeLayer(
+            self.proj_channel * self.anchor_feat_len,
+            hidden,
+            1)
+        nn.init.zeros_(self.accept_calib_head.layer[-1].weight.data)
+        nn.init.constant_(self.accept_calib_head.layer[-1].bias.data, bias_init)
+
+    def freeze_base_for_accept_calib(self):
+        for name, param in self.named_parameters():
+            param.requires_grad_(name.startswith('accept_calib_head.'))
+
+    def train(self, mode=True):
+        super(Anchor3DLanePP, self).train(mode)
+        if mode and getattr(self, 'accept_calib_freeze_base', False):
+            for name, module in self.named_children():
+                if name != 'accept_calib_head':
+                    module.eval()
+            self.accept_calib_head.train(True)
+        return self
+
+    def use_accept_calib(self, feat_idx, iter_idx):
+        if not self.accept_calib:
+            return False
+        if self.accept_calib_apply == 'final':
+            return feat_idx == self.feat_num - 1 and iter_idx == self.iter_reg - 1
+        if self.accept_calib_apply == 'all':
+            return True
+        raise ValueError(f'Unsupported accept_calib_apply: {self.accept_calib_apply}')
 
     def load_pretrained(self, ckpt, strict=True):
         pth = torch.load(ckpt, map_location='cpu')
@@ -317,11 +369,13 @@ class Anchor3DLanePP(BaseModule):
             
         reg_proposals_all = []
         anchors_all = []
+        accept_logits_all = []
 
         for iter_idx in range(self.iter_reg):
             
             reg_proposals_layer = []
             anchors_layer = []
+            accept_logits_layer = []
             
             for feat_idx, feat_size in enumerate(self.feat_sizes[::-1]):
                 # [4, 3, 2]
@@ -341,35 +395,42 @@ class Anchor3DLanePP(BaseModule):
                         xs = x_weights @ init_xs
                         xs = xs.squeeze(-1)
                         anchors = self.anchor_generator.generate_anchors_batch(xs, yaws, pitches)
-                        reg_proposals, update_anchors = self.get_proposals(project_matrixes, anchor_feats[select_idx], \
-                                                                                           feat_idx, anchors, feat_size, iter_idx, True)
+                        reg_proposals, update_anchors, accept_logits = self.get_proposals(
+                            project_matrixes, anchor_feats[select_idx], feat_idx, anchors, feat_size, iter_idx, True)
                         reg_proposals_layer.append(reg_proposals)
                         anchors_layer.append(update_anchors)
+                        accept_logits_layer.append(accept_logits)
                     else:
                         proposals_prev = reg_proposals_layer[feat_idx - 1]
-                        reg_proposals, _ = self.get_proposals(project_matrixes, anchor_feats[select_idx], \
-                                                                              feat_idx, proposals_prev, feat_size, iter_idx, False)
+                        reg_proposals, _, accept_logits = self.get_proposals(
+                            project_matrixes, anchor_feats[select_idx], feat_idx, proposals_prev, feat_size, iter_idx, False)
                         reg_proposals_layer.append(reg_proposals)
                         anchors_layer.append(proposals_prev[:, :, :5+self.anchor_len*3])
+                        accept_logits_layer.append(accept_logits)
                 else:
                     if feat_idx == 0:
                         proposals_prev = reg_proposals_all[iter_idx - 1][0]
-                        reg_proposals, update_anchors = self.get_proposals(project_matrixes, anchor_feats[select_idx], \
-                                                                                           feat_idx, proposals_prev, feat_size, iter_idx, True)
+                        reg_proposals, update_anchors, accept_logits = self.get_proposals(
+                            project_matrixes, anchor_feats[select_idx], feat_idx, proposals_prev, feat_size, iter_idx, True)
                         reg_proposals_layer.append(reg_proposals)
                         anchors_layer.append(update_anchors)
+                        accept_logits_layer.append(accept_logits)
                     else:
                         proposals_prev = reg_proposals_layer[feat_idx - 1]
-                        reg_proposals, _ = self.get_proposals(project_matrixes, anchor_feats[select_idx], \
-                                                                              feat_idx, proposals_prev, feat_size, iter_idx, False)
+                        reg_proposals, _, accept_logits = self.get_proposals(
+                            project_matrixes, anchor_feats[select_idx], feat_idx, proposals_prev, feat_size, iter_idx, False)
                         reg_proposals_layer.append(reg_proposals)
                         anchors_layer.append(proposals_prev[:, :, :5+self.anchor_len*3])
+                        accept_logits_layer.append(accept_logits)
             
             reg_proposals_all.append(reg_proposals_layer)
             anchors_all.append(anchors_layer)
+            accept_logits_all.append(accept_logits_layer)
 
                     
         output = {'reg_proposals':reg_proposals_all, 'anchors':anchors_all}
+        if self.accept_calib:
+            output['accept_logits'] = accept_logits_all
         return output
         
 
@@ -393,24 +454,34 @@ class Anchor3DLanePP(BaseModule):
         return h_g2feats
 
 
-    def nms(self, batch_proposals, batch_anchors, nms_thres=0, conf_threshold=None, refine_vis=False, vis_thresh=0.5):
+    def nms(self, batch_proposals, batch_anchors, nms_thres=0, conf_threshold=None,
+            refine_vis=False, vis_thresh=0.5, batch_accept_logits=None):
         softmax = nn.Softmax(dim=1)
         proposals_list = []
-        for proposals, anchors in zip(batch_proposals, batch_anchors):
+        if batch_accept_logits is None:
+            batch_accept_logits = [None] * batch_proposals.shape[0]
+        for proposals, anchors, accept_logits in zip(batch_proposals, batch_anchors, batch_accept_logits):
             anchor_inds = torch.arange(batch_proposals.shape[1], device=proposals.device)
             # The gradients do not have to (and can't) be calculated for the NMS procedure
             # apply nms
             if self.use_sigmoid:
-                scores = proposals[:, 5 + self.anchor_len * 3:5 + self.anchor_len * 3+self.num_category].sigmoid().max(dim=1)[0]
+                base_scores = proposals[:, 5 + self.anchor_len * 3:5 + self.anchor_len * 3+self.num_category].sigmoid().max(dim=1)[0]
             else:
-                scores = 1 - softmax(proposals[:, 5 + self.anchor_len * 3:5 + self.anchor_len * 3+self.num_category])[:, 0]  # pos_score
+                base_scores = 1 - softmax(proposals[:, 5 + self.anchor_len * 3:5 + self.anchor_len * 3+self.num_category])[:, 0]  # pos_score
+            scores = base_scores
+            eval_scores = base_scores
+            if accept_logits is not None:
+                accept_probs = accept_logits.sigmoid().to(base_scores.dtype)
+                scores = base_scores * accept_probs.clamp_min(1e-6).pow(self.accept_nms_power)
+                eval_scores = base_scores * (self.accept_score_floor + (1. - self.accept_score_floor) * accept_probs)
             if conf_threshold > 0:
-                above_threshold = scores > conf_threshold
+                above_threshold = base_scores > conf_threshold
                 proposals = proposals[above_threshold]
                 scores = scores[above_threshold]
+                eval_scores = eval_scores[above_threshold]
                 anchor_inds = anchor_inds[above_threshold]
             if proposals.shape[0] == 0:
-                proposals_list.append((proposals[[]], anchors[[]], None))
+                proposals_list.append((proposals[[]], anchors[[]], None, None))
                 continue
             if nms_thres > 0:
                 # refine vises to ensure consistent lane
@@ -423,9 +494,10 @@ class Anchor3DLanePP(BaseModule):
                 keep = nms_3d(proposals, scores, refined_vises, thresh=nms_thres, anchor_len=self.anchor_len)
                 proposals = proposals[keep]
                 anchor_inds = anchor_inds[keep]
-                proposals_list.append((proposals, anchors[anchor_inds], anchor_inds))
+                eval_scores = eval_scores[keep]
+                proposals_list.append((proposals, anchors[anchor_inds], anchor_inds, eval_scores))
             else:
-                proposals_list.append((proposals, anchors[anchor_inds], anchor_inds))
+                proposals_list.append((proposals, anchors[anchor_inds], anchor_inds, eval_scores))
         return proposals_list
 
     @force_fp32()
@@ -457,6 +529,10 @@ class Anchor3DLanePP(BaseModule):
         batch_anchor_features = batch_anchor_features.flatten(2, 3)  # [B, N, C*l]
         batch_anchor_features = self.dynamic_head[f'layer_{feat_idx}'][iter_idx](batch_anchor_features) # [B, N, Cl]
         batch_anchor_features = batch_anchor_features.flatten(0, 1)  # [B*N, C*l]
+        accept_logits = None
+        if self.use_accept_calib(feat_idx, iter_idx):
+            accept_features = batch_anchor_features.detach() if self.accept_calib_detach else batch_anchor_features
+            accept_logits = self.accept_calib_head(accept_features).reshape(batch_size, -1)
 
         # Predict
         cls_logits = self.cls_layer[f'layer_{feat_idx}'][iter_idx](batch_anchor_features)   # [B * N, C]
@@ -493,9 +569,9 @@ class Anchor3DLanePP(BaseModule):
         reg_proposals[:, :, 5+self.anchor_len*3:5+self.anchor_len*3+self.num_category] = cls_logits   # [B, N, C]
 
         if reg_prior:
-            return reg_proposals, cur_anchors
+            return reg_proposals, cur_anchors, accept_logits
         else:
-            return reg_proposals, None
+            return reg_proposals, None, accept_logits
 
 
 
@@ -503,9 +579,11 @@ class Anchor3DLanePP(BaseModule):
         gt_project_matrix = gt_project_matrix.squeeze(1)
         output = self.encoder_decoder(img, mask, gt_project_matrix, **kwargs)
 
+        accept_logits = output.get('accept_logits', [[None]])[-1][-1]
         proposals_list = self.nms(output['reg_proposals'][-1][-1], output['anchors'][-1][-1], self.test_cfg.nms_thres, 
                                   self.test_cfg.conf_threshold, refine_vis=self.test_cfg.refine_vis,
-                                  vis_thresh=self.test_cfg.vis_thresh)
+                                  vis_thresh=self.test_cfg.vis_thresh,
+                                  batch_accept_logits=accept_logits)
 
         output['proposals_list'] = proposals_list
 
@@ -530,12 +608,24 @@ class Anchor3DLanePP(BaseModule):
     @force_fp32()
     def loss(self, output, gt_3dlanes):
         losses = dict()
+        metric_sums = {}
+        metric_counts = {}
         # postprocess
         for iter_idx in range(self.iter_reg):
             for feat_idx in range(self.feat_num):
                 proposals_list = []
-                for proposal, anchor in zip(output['reg_proposals'][iter_idx][feat_idx], output['anchors'][iter_idx][feat_idx]):
-                    proposals_list.append((proposal, anchor))
+                accept_logits = None
+                if 'accept_logits' in output:
+                    accept_logits = output['accept_logits'][iter_idx][feat_idx]
+                if accept_logits is None:
+                    accept_iter = [None] * len(output['reg_proposals'][iter_idx][feat_idx])
+                else:
+                    accept_iter = accept_logits
+                for proposal, anchor, accept_logit in zip(
+                        output['reg_proposals'][iter_idx][feat_idx],
+                        output['anchors'][iter_idx][feat_idx],
+                        accept_iter):
+                    proposals_list.append((proposal, anchor, accept_logit))
                 anchor_losses = self.lane_loss[f'loss_{feat_idx}'][iter_idx](proposals_list, gt_3dlanes)
                 for k, v in anchor_losses['losses'].items():
                     if 'loss' in k:
@@ -543,10 +633,17 @@ class Anchor3DLanePP(BaseModule):
                             losses[k+f'_{feat_idx}'] = v
                         else:
                             losses[k+f'_{feat_idx}_{iter_idx}'] = v
+                for k, v in anchor_losses.items():
+                    if k in ('losses', 'batch_positives', 'batch_negatives'):
+                        continue
+                    metric_sums[k] = metric_sums.get(k, 0) + v
+                    metric_counts[k] = metric_counts.get(k, 0) + 1
                 
         other_vars = {}
         other_vars['batch_positives'] = anchor_losses['batch_positives']
         other_vars['batch_negatives'] = anchor_losses['batch_negatives']
+        for k, v in metric_sums.items():
+            other_vars[k] = v / metric_counts[k]
         return losses, other_vars
 
     @auto_fp16(apply_to=('img', 'mask', ))

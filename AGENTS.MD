@@ -1,4 +1,4 @@
-[系统状态]：Anchor3DLane-pp is deployed and the official checkpoint baseline is reproduced on OpenLane validation, current stable F1 = 62.543; latest successful experiment is `vdcc`; ApolloSim is not mounted yet.
+[系统状态]：Anchor3DLane-pp is deployed and the official checkpoint baseline is reproduced on OpenLane validation, current stable F1 = 62.550; latest successful experiment is `eac_dr`; latest failed experiment is `dags`; current running experiment is none; ApolloSim is not mounted yet.
 
 # Anchor3DLane-pp Agent Notes
 
@@ -10,7 +10,7 @@
 
 ## Current Structure
 - Remote path: `/root/autodl-tmp/Anchor3DLane-pp` on `anchor3dlane-seetacloud`.
-- Active code branch: `anchor3dlane-pp`, tracking `origin/anchor3dlane++`.
+- Active code branch: `anchor3dlane-pp`, tracking `hsiangpo/anchor3dlane-pp`.
 - `configs/openlane/`: OpenLane training and evaluation configs.
 - `configs_v2/openlane/anchor3dlane++_r50x2.py`: official camera-only baseline config for OpenLane-v1.2 F1 = 62.4.
 - `mmseg/models/lane_detector/`: Anchor3DLane and Anchor3DLane++ model implementation.
@@ -35,12 +35,218 @@
   - Result file: `/root/autodl-tmp/Anchor3DLane-pp/output/openlane/baseline_eval/evaluation_result.json`
   - Metrics: F1 `0.6240448139487519`, recall `0.613268850798542`, precision `0.6352062468171787`, category accuracy `0.9337897428296154`.
 - Current stable score:
-  - Experiment: `strip_sample + vdcc` / visibility-weighted differential curve consistency.
-  - Result file: `/root/autodl-tmp/Anchor3DLane-pp/output/openlane/experiments/vdcc_r50x2_eval/evaluation_result.json`.
-  - Metrics: F1 `0.6254260715979268`, recall `0.6176413943634846`, precision `0.6334094879720468`, category accuracy `0.9355990687233905`.
-  - Improvement over previous stable `strip_sample`: `+0.0002148629966159` F1, or `+0.021486` points on the 0-100 reporting scale.
-  - Improvement over official checkpoint baseline: `+0.0013812576491749` F1, or `+0.138126` points on the 0-100 reporting scale.
+  - Experiment: `strip_sample + vdcc + eac_dr` / evaluator-acceptance calibrated duplicate reranking.
+  - Result file: `/root/autodl-tmp/Anchor3DLane-pp/output/openlane/experiments/eac_dr_r50x2_eval/evaluation_result.json`.
+  - Metrics: F1 `0.625498769106239`, recall `0.6162575877540248`, precision `0.6350213248393889`, category accuracy `0.93595710615482`.
+  - Improvement over previous stable `strip_sample + vdcc`: `+0.00007269750831218058` F1, or `+0.007270` points on the 0-100 reporting scale.
+  - Improvement over official checkpoint baseline: `+0.0014539551574871412` F1, or `+0.145396` points on the 0-100 reporting scale.
 - Latest successful score-improvement experiment:
+  - Selected idea: EAC-DR / Evaluator-Acceptance Calibrated Duplicate Reranker.
+  - Rationale: recent geometry and candidate-generation routes mostly disturbed the current V-DCC precision/recall balance. EAC-DR keeps the 30-proposal geometry, matcher, and candidate count unchanged, freezes the stable V-DCC base, and trains only a final-layer evaluator-acceptance calibration head to rerank existing candidates with an OpenLane-style 1.5m / 75% acceptance label and duplicate ordering loss.
+  - Code: `mmseg/models/lane_detector/anchor_3dlane_pp.py` adds optional final-only `accept_calib_head`, frozen-base train-mode handling, and weak calibrated NMS/output scores; `mmseg/models/losses/lane_loss_v2.py` adds optional `accept_calib_losses` and `dup_rank_losses`; `mmseg/apis/test_openlane.py` consumes optional calibrated scores; config is `configs_v2/openlane/experiments/anchor3dlane++_r50x2_eac_dr.py`.
+  - Checkpoint source: `output/openlane/experiments/vdcc_r50x2/iter_10000.pth`.
+  - Validation gates passed:
+    - Local `py_compile` and `git diff --check` passed.
+    - Remote `py_compile`, `git diff --check`, config/model/checkpoint load passed; expected missing keys are only `accept_calib_head.*`.
+    - Remote train-mode sanity passed: only six `accept_calib_head.*` parameters are trainable; backbone, neck, and dynamic head stay in eval mode while the calibration head stays in train mode.
+    - Remote synthetic acceptance-label sanity passed: exact-GT proposals become accepted, >1.5m shifted proposals become hard negatives, ignored proposals do not receive gradients.
+    - Code review subagent found no remaining blocking or high-risk issue after fixing frozen-base eval mode and reducing `samples_per_gpu` back to 3.
+    - Remote 2-GPU DDP smoke passed:
+      - 1-iter smoke completed with no OOM/NaN/Traceback/DDP hard error.
+      - 20-iter smoke completed; memory about `18974MB`, `batch_accept_pos`, `batch_accept_neg`, `batch_accept_ignore`, and `batch_dup_rank_pairs` were nonzero, losses stayed finite, and grad norm remained small.
+  - Formal training and validation completed:
+    - Training log: `logs/train_eac_dr_20260512_023028.log`.
+    - Final checkpoint: `output/openlane/experiments/eac_dr_r50x2/iter_10000.pth`.
+    - Evaluation log: `logs/eval_eac_dr_detached_20260512_025354.log`.
+    - Result file: `output/openlane/experiments/eac_dr_r50x2_eval/evaluation_result.json`.
+    - Metrics: F1 `0.625498769106239`, recall `0.6162575877540248`, precision `0.6350213248393889`, category accuracy `0.93595710615482`.
+  - Decision: EAC-DR improves over the previous stable F1 `0.6254260715979268` and official baseline F1 `0.6240448139487519`; keep the implementation, record it in `docs/实验记录.md`, and commit/push this stable version. The minimum target F1 > 65 is still not reached.
+- Latest failed score-improvement experiment:
+  - Selected idea: DAGS / Depth-Aware Grade-State Anchor.
+  - Rationale: previous pseudo-BEV, auxiliary depth, full-image road-surface, deformable sampling, temporal memory, and lane-set graph routes did not create evaluator-aligned 3D gains. DAGS keeps the 30-proposal path unchanged but injects a lane-local low-dimensional z/grade state directly into the anchor geometry before refinement.
+  - Code: `mmseg/models/lane_detector/anchor_3dlane_pp.py` temporarily added optional `depth_grade_state` with low-dimensional z/grade deltas injected into anchor z slots before refinement; `mmseg/models/losses/lane_loss_v2.py` temporarily added optional `depth_state_losses`; config was `configs_v2/openlane/experiments/anchor3dlane++_r50x2_dags.py`. Failed code and config must stay rolled back.
+  - Checkpoint source: `output/openlane/experiments/vdcc_r50x2/iter_10000.pth`.
+  - Validation gates passed: local `py_compile`, local `git diff --check`, code-review subagent PASS after fixing a DDP log Tensor-type issue, remote `py_compile`, remote `git diff --check`, remote config/model/checkpoint load, synthetic loss sanity, and 1-iter plus 20-iter 2-GPU DDP smoke.
+  - Formal training and validation completed:
+    - PID file: `logs/train_dags.pid`.
+    - Training log: `logs/train_dags_20260512_003759.log`.
+    - Final checkpoint: `output/openlane/experiments/dags_r50x2/iter_10000.pth`.
+    - Evaluation log: `logs/eval_dags_20260512_013421.log`.
+    - Result file: `output/openlane/experiments/dags_r50x2_eval/evaluation_result.json`.
+    - Metrics: F1 `0.6241304991935637`, recall `0.6165429087044288`, precision `0.6319071726177142`, category accuracy `0.9329762943436856`.
+  - Decision: DAGS regressed below current stable F1 `0.6254260715979268`; failed implementation code and config are rolled back, and the failure is documented in `docs/失败路线.md`.
+  - Avoid repeating lane-local low-dimensional z/grade delta injection into anchor z slots or only tuning `depth_state_losses`, `delta_min`, `delta_max`, `coeff_dim`, `gate_init`, or `depth_state_slope_weight`.
+- Previous failed score-improvement experiment:
+  - Selected idea: LSG-PG / Lane-Set Graph Prior Generator.
+  - Rationale: previous failures show that output-stage hard topology losses, extra candidates, unaligned temporal memory, and extra image sampling freedom all destabilize precision/recall. LSG-PG moves lane-set reasoning earlier: after `expert_layer` predicts the initial 30 lane priors `(yaw, pitch, x_start)`, a latent graph generator treats the 30 slots as nodes in one lane-set graph and applies a zero-initialized soft graph residual to the initial priors before anchor generation.
+  - Code: `mmseg/models/lane_detector/graph/lane_set_graph.py` temporarily added `LaneSetGraphPrior` with global image context, rank embeddings, pairwise prior bias, soft graph attention, small gated `delta_prior`, and logging stats. `mmseg/models/lane_detector/anchor_3dlane_pp.py` temporarily added optional `lane_set_graph` config and logged `graph_gate`, `graph_prior_delta`, and `graph_edge_entropy`. Failed code has been rolled back.
+  - Config: `configs_v2/openlane/experiments/anchor3dlane++_r50x2_lsg_pg.py`, loading `output/openlane/experiments/vdcc_r50x2/iter_10000.pth`, `samples_per_gpu=3`, `lr=1e-5`, `max_iters=10000`, work dir `output/openlane/experiments/lsg_pg_r50x2`. Failed config has been removed.
+  - Local validation so far:
+    - `python -m py_compile mmseg/models/lane_detector/graph/lane_set_graph.py mmseg/models/lane_detector/anchor_3dlane_pp.py` passed.
+    - `git diff --check` passed.
+  - Validation before formal training:
+    - Remote config/model/checkpoint load passed; expected missing keys are only `lane_set_graph.*`, with `unexpected=[]`.
+    - Remote graph shape sanity passed: output prior shape `(2, 30, 3)`, initial max delta `0.0`, `graph_gate≈0.0180`, `graph_edge_entropy≈3.3623`.
+    - Code review subagent found no blocking OOM, tensor-shape, DDP, checkpoint-load, gradient, default-behavior, or failed-route issue.
+    - Remote 2-GPU DDP smoke passed with `samples_per_gpu=3`:
+      - 1-iter smoke completed and wrote `output/openlane/smoke/lsg_pg_1iter/iter_1.pth`.
+      - 20-iter smoke completed and wrote `output/openlane/smoke/lsg_pg_20iter/iter_20.pth`; memory about `27392MB`, `graph_gate=0.0180`, `graph_edge_entropy=3.3515`, finite loss/grad, and no OOM/NaN/Traceback/DDP hard error.
+  - Formal training and validation completed:
+    - PID file: `logs/train_lsg_pg.pid`.
+    - Training log: `logs/train_lsg_pg_restart_20260511_225953.log`.
+    - Final checkpoint: `output/openlane/experiments/lsg_pg_r50x2/iter_10000.pth`.
+    - Evaluation log: `logs/eval_lsg_pg_20260511_235631.log`.
+    - Result file: `output/openlane/experiments/lsg_pg_r50x2_eval/evaluation_result.json`.
+    - Metrics: F1 `0.6233816221598949`, recall `0.6146954555505625`, precision `0.6323167931714432`, category accuracy `0.9333910356637629`.
+    - Note: the first formal attempt reached `iter 2490` but failed while saving `iter_2500.pth` because `/root/autodl-tmp` was full. Smoke checkpoints, LP-DCA failed training checkpoints, PLDD smoke checkpoint, the partial LSG-PG checkpoint, and the V-DCC intermediate `iter_7500.pth` were removed; stable `strip_sample` and `vdcc` final checkpoints and all evaluation results were preserved. Free space recovered to about `28GB`, then LSG-PG was restarted from the stable V-DCC checkpoint.
+  - Decision: LSG-PG regressed below both current stable F1 `0.6254260715979268` and official baseline F1 `0.6240448139487519`; failed implementation code and config are rolled back, and the failure is documented in `docs/失败路线.md`.
+  - Avoid repeating initial-prior lane-set graph residuals or only tuning `hidden_channels`, `num_layers`, `delta_scale`, `gate_init`, edge temperature, or learning rate.
+- Previous failed score-improvement experiment:
+  - Selected idea: LP-DCA / Lane-Point Deformable Cross-Attention.
+  - Rationale: current stable gains came from projection-aware local strip sampling plus V-DCC geometry supervision. LP-DCA upgrades fixed local strip sampling into proposal-guided multi-level deformable feature fusion, so each projected lane point can learn where to gather image evidence without adding proposals, changing matcher/NMS/thresholds, or using unavailable temporal pose.
+  - Code: `mmseg/models/lane_detector/anchor_3dlane_pp.py` temporarily added optional `proposal_deform_fuse`, `proposal_deform_apply`, and a zero-initialized `ProposalDeformFeatureFusion` residual branch. Invalid projected points were masked so out-of-image locations did not add edge-clamped deformable residuals. Failed code has been rolled back.
+  - Config: `configs_v2/openlane/experiments/anchor3dlane++_r50x2_lpdca.py`, loading `output/openlane/experiments/vdcc_r50x2/iter_10000.pth`, `samples_per_gpu=3`, `lr=1e-5`, `max_iters=10000`, work dir `output/openlane/experiments/lpdca_r50x2`. Failed config has been removed.
+  - Validation before formal training:
+    - Local `py_compile` and `git diff --check` passed.
+    - Code review subagent reported no blocking OOM, tensor-shape, DDP, checkpoint-load, gradient, default-behavior, or failed-route issue. The main non-blocking precision risk was out-of-image reference point clamping; this was fixed with `valid_mask` residual masking and re-reviewed with no blocking issue.
+    - Remote config/model/checkpoint load passed; expected missing keys are only `proposal_deform_fuser.*`, with `unexpected=[]` and initial gate about `0.0180`.
+    - Remote 2-GPU DDP smoke passed with `samples_per_gpu=3`:
+      - Pre-mask 1-iter and 20-iter smoke passed with memory about `27394MB`.
+      - Masked 1-iter smoke passed with memory about `27395MB`, finite loss/grad, and no OOM/NaN/Traceback/DDP hard error.
+      - Masked 20-iter smoke passed with memory about `27394MB`, finite loss/grad, and no OOM/NaN/Traceback/DDP hard error.
+  - Formal training and validation completed:
+    - Training log: `logs/train_lpdca_20260511_210054.log`.
+    - Final checkpoint: `output/openlane/experiments/lpdca_r50x2/iter_10000.pth`.
+    - Evaluation log: `logs/eval_lpdca_20260511_215936.log`.
+    - Result file: `output/openlane/experiments/lpdca_r50x2_eval/evaluation_result.json`.
+    - Metrics: F1 `0.621898598348344`, recall `0.6132403187035016`, precision `0.6308048701648529`, category accuracy `0.9336345717579679`.
+  - Decision: LP-DCA regressed below both current stable F1 `0.6254260715979268` and official baseline F1 `0.6240448139487519`; failed implementation code and config are rolled back, and the failure is documented in `docs/失败路线.md`.
+  - Avoid repeating standalone projection-point multi-level deformable cross-attention residual or only tuning `proposal_deform_heads`, `proposal_deform_points`, `proposal_deform_gate_init`, `proposal_deform_apply`, or learning rate.
+- Previous failed score-improvement experiment:
+  - Selected idea: PF-ATM / Pose-Free Anchor Token Memory.
+  - Rationale: multiple geometry-only regularizers failed to move F1 enough, and true pose-based temporal fusion is blocked because the remote data lacks `prev_data_release` and raw per-frame poses. PF-ATM instead keeps the stable 30-proposal output path unchanged, samples the previous frame from the same segment as appearance-only context, and injects that context into the final anchor tokens through a zero-initialized temporal memory attention block. It adds temporal information without changing candidate count, matcher, NMS, or thresholds.
+  - Code: `mmseg/datasets/lane_datasets/openlane_temporal.py` now supports `pose_free_neighbor=True` to sample previous images directly from the current segment without `prev_data_release`; `mmseg/models/lane_detector/anchor_3dlane_pp.py` adds optional `temporal_memory`, multi-frame input splitting, detached previous-frame feature extraction, and final-only anchor-token cross-attention memory; config is `configs_v2/openlane/experiments/anchor3dlane++_r50x2_pfatm.py`.
+  - Validation before formal training:
+    - Local `py_compile` and `git diff --check` passed.
+    - Remote dataset sanity passed: `OpenlaneMFDataset(pose_free_neighbor=True)` returns `img` shape `(3, 720, 960, 2)` and does not require `prev_poses`.
+    - Remote config/model/checkpoint load passed; expected missing keys are only `temporal_gate_logit` and `temporal_attn.*`.
+    - Remote 2-GPU DDP smoke passed:
+      - `samples_per_gpu=2`, 1-iter and 20-iter smoke passed with memory about `24711MB`, `temporal_gate≈0.0180`, and no OOM/NaN/Traceback/DDP hard error.
+      - `samples_per_gpu=3`, 1-iter and 20-iter smoke also passed with memory about `27413MB`, `temporal_gate≈0.0180`, and no OOM/NaN/Traceback/DDP hard error, so the formal run should use `samples_per_gpu=3`.
+  - Formal training and validation completed:
+    - Training log: `logs/train_pfatm_20260511_175519.log`.
+    - Final checkpoint: `output/openlane/experiments/pfatm_r50x2/iter_10000.pth`.
+    - Evaluation log: `logs/eval_pfatm_20260511_190422.log`.
+    - Result file: `output/openlane/experiments/pfatm_r50x2_eval/evaluation_result.json`.
+    - Metrics: F1 `0.6246655423443693`, recall `0.6159437347085803`, precision `0.633637900643908`, category accuracy `0.9357944229784461`.
+  - Decision: PF-ATM improved over the official baseline but still regressed below current stable F1 `0.6254260715979268`; failed implementation code and config must be rolled back, and the failure is documented in `docs/失败路线.md`.
+  - Avoid repeating unaligned previous-frame anchor-token memory or only tuning `temporal_gate_init`, `prev_num`, or `prev_step`.
+- Previous failed score-improvement experiment:
+  - Selected idea: RSMC / Road-Surface Manifold Consistency.
+  - Rationale: `ALTCR` showed that simple adjacent-lane gap/order regression is too weak and still slightly over-constrains the main branch. RSMC instead fits a lightweight road-surface manifold `z=f(x,y)` from matched GT visible points in each image, then only constrains matched positive `z_pred` to stay near that manifold. It does not add candidates, does not touch matcher/NMS/thresholds, and targets the low-frequency `z` geometry that V-DCC does not explicitly regularize.
+  - Code: `mmseg/models/losses/lane_loss_v2.py` adds optional `road_surface_losses` with configurable basis/ridge/min-point gating; `mmseg/models/lane_detector/anchor_3dlane_pp.py` only forwards `batch_road_surface_points` into logs; config is `configs_v2/openlane/experiments/anchor3dlane++_r50x2_rsmc.py`.
+  - Validation before formal training:
+    - Local `py_compile` and `git diff --check` passed.
+    - Code review subagent found no blocking OOM/DDP/dimension/checkpoint issue; only residual risk is over-regularizing noisy road-height structure.
+    - Remote config/model/checkpoint load passed.
+    - Remote synthetic sanity passed: `road_surface_loss` is near zero when `pred=gt`, rises clearly when one lane's `z` is shifted, and returns zero safely for single-lane input.
+    - Remote 2-GPU DDP smoke passed with `samples_per_gpu=3`:
+      - 1-iter smoke work dir: `output/openlane/smoke/rsmc_1iter`, checkpoint `iter_1.pth`, memory `27397MB`, `batch_road_surface_points=35.3333`, no OOM/NaN/Traceback/DDP hard error.
+      - 20-iter smoke work dir: `output/openlane/smoke/rsmc_20iter`, memory about `27397MB`, `batch_road_surface_points` stayed nonzero, `road_surface_losses_2_1` stayed finite, and no OOM/NaN/Traceback/DDP hard error occurred.
+  - Formal training and validation completed:
+    - Training log: `logs/train_rsmc_20260511_154124.log`.
+    - Final checkpoint: `output/openlane/experiments/rsmc_r50x2/iter_10000.pth`.
+    - Evaluation log: `logs/eval_rsmc_20260511_163834.log`.
+    - Result file: `output/openlane/experiments/rsmc_r50x2_eval/evaluation_result.json`.
+    - Metrics: F1 `0.6245115219076193`, recall `0.6167925645360325`, precision `0.6324261282195098`, category accuracy `0.9345657249914631`.
+  - Decision: RSMC improved over the official baseline but still regressed below current stable F1 `0.6254260715979268`; failed implementation code and config must be rolled back, and the failure is documented in `docs/失败路线.md`.
+  - Avoid repeating direct full-image low-dimensional road-surface manifold fitting or only tuning its basis, ridge, min-point threshold, or fitting window.
+- Previous failed score-improvement experiment:
+  - Selected idea: AL-TCR / Adjacent-Lane Topology Consistent Regression.
+  - Rationale: `requery_rank` proved that raising recall by adding extra output candidates destroys precision. AL-TCR keeps the stable 30-proposal output path unchanged and instead adds a matched-positive-only topology loss over adjacent GT lane pairs, constraining lateral gap, gap slope, and non-crossing order so lane-set structure stays coherent without touching matcher, NMS, thresholds, or candidate count.
+  - Code: `mmseg/models/losses/lane_loss_v2.py` adds optional `topology_losses` with `topology_gap_weight`, `topology_slope_weight`, `topology_order_weight`, `topology_order_margin`, `topology_min_common`, width filtering, and reference-y sorting; `mmseg/models/lane_detector/anchor_3dlane_pp.py` only forwards `batch_topology_pairs` into logs; config is `configs_v2/openlane/experiments/anchor3dlane++_r50x2_altcr.py`.
+  - Validation before formal training:
+    - Local `py_compile` and `git diff --check` passed.
+    - Code review subagent found no blocking OOM/DDP/dimension/checkpoint issue; only residual risk is possible over-regularization, so the initial weight stays conservative at `topology_losses=0.02`.
+    - Remote config/model/checkpoint load passed with no new model parameter mismatch risk because AL-TCR is a pure loss change.
+    - Remote synthetic sanity passed: `topology_loss=0` when `pred=gt`, increases clearly when adjacent lanes are collapsed, and returns zero safely for single-lane input.
+    - Remote 2-GPU DDP smoke passed with `samples_per_gpu=3`:
+      - 1-iter smoke work dir: `output/openlane/smoke/altcr_1iter`, checkpoint `iter_1.pth`, memory `27397MB`, `batch_topology_pairs=3.0000`, `topology_losses_2_1=0.0002`, no OOM/NaN/Traceback/DDP hard error.
+      - 20-iter smoke work dir: `output/openlane/smoke/altcr_20iter`, memory about `27395MB`, `batch_topology_pairs` stayed nonzero across iterations, `topology_losses_2_1` stayed finite, and no OOM/NaN/Traceback/DDP hard error occurred.
+  - Formal training and validation completed:
+    - Training log: `logs/train_altcr_20260511_141736.log`.
+    - Final checkpoint: `output/openlane/experiments/altcr_r50x2/iter_10000.pth`.
+    - Evaluation log: `logs/eval_altcr_20260511_151536.log`.
+    - Result file: `output/openlane/experiments/altcr_r50x2_eval/evaluation_result.json`.
+    - Metrics: F1 `0.6246505348380557`, recall `0.6164573124193077`, precision `0.6330644801129005`, category accuracy `0.9348865601790619`.
+  - Decision: AL-TCR improved over the official baseline but still regressed below current stable F1 `0.6254260715979268`; failed implementation code and config must be rolled back, and the failure is documented in `docs/失败路线.md`.
+  - Avoid repeating direct adjacent-lane gap/order regression or only tuning topology weights, ordering margin, reference-y band, or width filters.
+- Previous failed score-improvement experiment:
+  - Selected idea: RQR-MPR / Recall-Reserved ReQuery with Multi-Positive Ranking.
+  - Rationale: HPAS showed that simply adding more candidates turns into extra negative-sample pressure and hurts recall. RQR-MPR keeps the stable 30-slot main branch untouched, then selects `K=8` low-to-mid-confidence final proposals as recall-reserved seeds, runs a lightweight requery refine + rank branch on them, and trains that branch with multi-positive/ignore-near-GT ranking instead of pushing all added candidates into the main background pool.
+  - Code: `mmseg/models/lane_detector/anchor_3dlane_pp.py` adds optional `requery_enable`, seed selection, detached requery token extraction, requery refine heads, and rank-aware test-time merge; `mmseg/models/losses/lane_loss_v2.py` adds `RecallRequeryLoss`; config is `configs_v2/openlane/experiments/anchor3dlane++_r50x2_requery_rank.py`.
+  - Safety fix after code review: requery loss originally still backpropagated into shared `strip_weight_logits` and `position_encoder`; this was fixed by detaching the composed requery feature tensor before it enters the requery head, so the stable main branch stays isolated from the requery loss path.
+  - Validation before formal training:
+    - Local `py_compile` and `git diff --check` passed.
+    - Remote config/model/checkpoint load passed; expected missing keys are only the new requery modules.
+    - Code review subagent found no blocking OOM/DDP/dimension/checkpoint issue; one high-risk main-branch gradient leakage issue was reported and fixed before formal training.
+    - Remote 2-GPU DDP smoke passed with `samples_per_gpu=3`:
+      - 1-iter smoke work dir: `output/openlane/smoke/requery_rank_1iter`, checkpoint `iter_1.pth`, memory `27781MB`, requery losses visible in log, no OOM/NaN/Traceback/DDP hard error.
+      - 20-iter smoke work dir: `output/openlane/smoke/requery_rank_20iter`, final memory `27781MB`, representative `batch_requery_positives` about `4-7`, `batch_requery_negatives` about `0-3`, no OOM/NaN/Traceback/DDP hard error.
+  - Formal training and validation completed:
+    - Training log: `logs/train_requery_rank_20260511_124808.log`.
+    - Final checkpoint: `output/openlane/experiments/requery_rank_r50x2/iter_10000.pth`.
+    - Evaluation log: `logs/eval_requery_rank_20260511_134819.log`.
+    - Result file: `output/openlane/experiments/requery_rank_r50x2_eval/evaluation_result.json`.
+    - Metrics: F1 `0.5532158690914618`, recall `0.6530853894274322`, precision `0.4798390934412812`, category accuracy `0.8756303855775722`.
+  - Decision: RQR-MPR caused a severe precision collapse and regressed far below both current stable F1 `0.6254260715979268` and official baseline F1 `0.6240448139487519`; failed implementation code and config must be rolled back, and the failure is documented in `docs/失败路线.md`.
+  - Avoid repeating direct requery-candidate merge into final NMS or only tuning `requery_num`, seed score band, positive/ignore distance, or ranking-loss weights.
+- Previous failed score-improvement experiment:
+  - Selected idea: HPAS-K15 / Hybrid Prototype Anchor Set.
+  - Rationale: recent failed experiments often raised precision but reduced recall, suggesting the model is becoming too conservative rather than gaining candidate coverage. HPAS-K15 keeps the original 30 dynamic anchor slots and appends 15 data-driven fixed prototype anchors clustered from OpenLane training GT `(yaw, pitch, x_start)` priors, so the proposal set changes from 30 to 45 candidates without changing loss, matcher, NMS, inference threshold, V-DCC geometry loss, or the original dynamic slot checkpoint shapes.
+  - Code: `mmseg/models/lane_detector/proposal/prototype_anchor_set.py` generates fixed prototype anchors; `mmseg/models/lane_detector/anchor_3dlane_pp.py` adds optional `prototype_anchor_set`, `prototype_priors`, and `prototype_apply='init'`, appends the prototype anchors only at the first proposal generation step, and replaces downstream proposal-count assumptions with runtime `num_proposals`.
+  - Config: `configs_v2/openlane/experiments/anchor3dlane++_r50x2_hpas_k15.py`, loading `output/openlane/experiments/vdcc_r50x2/iter_10000.pth`, `samples_per_gpu=3`, `lr=1e-5`, `max_iters=10000`, work dir `output/openlane/experiments/hpas_k15_r50x2`.
+  - Prototype source: remote OpenLane training cache was scanned with robust filtering `|yaw| <= 0.25` and `|pitch| <= 0.08`; k-means produced 15 priors sorted by `x_start`, with shapes verified as prototype priors `[15, 3]`, anchors `[B,45,65]`, and proposals `[B,45,86]`.
+  - Validation before formal training: local and remote `py_compile` and `git diff --check` passed; remote config/model/checkpoint load passed with only expected missing key `prototype_anchors.prototype_priors` and no unexpected keys; shape sanity passed; code review subagent found no blocking OOM, DDP, tensor-shape, checkpoint-load, default-behavior, or failed-route issue.
+  - Remote 2-GPU DDP smoke passed:
+    - 1-iter smoke wrote `output/openlane/smoke/hpas_k15_1iter/iter_1.pth` with no OOM/NaN/Traceback/DDP hard error; smoke checkpoints were deleted afterward.
+    - 20-iter smoke log: `logs/smoke_hpas_k15_20iter_20260511_070635.log`.
+    - Iter 10: memory `27395MB`, `batch_positives=4.7333`, `batch_negatives=40.2667`, loss `1.9280`, grad_norm `318.3642`.
+    - Iter 20: memory `27395MB`, `batch_positives=3.5000`, `batch_negatives=41.5000`, loss `1.4382`, grad_norm `285.9323`.
+  - Formal training and validation completed:
+    - Training log: `logs/train_hpas_k15_20260511_070831.log`.
+    - Final checkpoint: `output/openlane/experiments/hpas_k15_r50x2/iter_10000.pth`.
+    - Evaluation log: `logs/eval_hpas_k15_20260511_080632.log`.
+    - Result file: `output/openlane/experiments/hpas_k15_r50x2_eval/evaluation_result.json`.
+    - Metrics: F1 `0.6222420045455334`, recall `0.6087821788534378`, precision `0.6363104648931212`, category accuracy `0.9372627165064314`.
+  - Decision: HPAS-K15 regressed below current stable F1 `0.6254260715979268` and official baseline F1 `0.6240448139487519`; failed implementation code and config were rolled back, and the failure is documented in `docs/失败路线.md`.
+  - Avoid repeating direct fixed GT-clustered prototype anchor appending or only tuning prototype count, clustering filters, or `prototype_apply`.
+- Previous failed score-improvement experiment:
+  - Selected idea: ABS-Gate / Anchor-BEV State Gate.
+  - Rationale: PLDD showed that training-only depth supervision does not transfer enough 3D structure into proposal generation. ABS-Gate instead builds a lightweight BEV state from image features and samples that state along each anchor path, so the spatial prior participates directly in final-stage proposal/refinement without adding proposals, changing matcher behavior, changing inference thresholds, or adding local strip sampling freedom.
+  - Code: `mmseg/models/lane_detector/anchor_3dlane_pp.py` temporarily added optional `anchor_bev_state`, BEV lift/projection helpers, anchor-path BEV sampling, and zero-initialized gated residual fusion into the anchor token. Failed code has been rolled back.
+  - Config: `configs_v2/openlane/experiments/anchor3dlane++_r50x2_abs_gate.py`, loading `output/openlane/experiments/vdcc_r50x2/iter_10000.pth`, `samples_per_gpu=3`, `lr=1e-5`, `max_iters=10000`, final feature level/final refinement only. Failed config has been removed.
+  - Validation before formal training: local and remote `py_compile` and `git diff --check` passed; remote config/model/checkpoint load passed with only expected BEV missing keys; remote shape sanity produced `bev_state=[2,64,96,48]` and `bev_anchor=[2,64,30,20]`; code review subagent found no blocking OOM, DDP, tensor-shape, checkpoint-load, default-behavior, or failed-route issue; 1-iter and 20-iter 2-GPU DDP smoke passed with finite loss/grad, memory about `27.4GB`, and no OOM/NaN/Traceback/DDP hard error.
+  - Formal training and validation completed:
+    - Training log: `logs/train_abs_gate_20260511_052931.log`.
+    - Final checkpoint: `output/openlane/experiments/abs_gate_r50x2/iter_10000.pth`.
+    - Evaluation log: `logs/eval_abs_gate_20260511_062600.log`.
+    - Result file: `output/openlane/experiments/abs_gate_r50x2_eval/evaluation_result.json`.
+    - Metrics: F1 `0.6247938857930223`, recall `0.6103657101281804`, precision `0.6399206992880959`, category accuracy `0.9355821930576786`.
+  - Decision: ABS-Gate improves over official baseline but regresses below current stable F1 `0.6254260715979268`; do not record it in `docs/实验记录.md`, keep only the failure analysis in `docs/失败路线.md`, and avoid repeating standalone single-frame anchor-BEV residual gating or only tuning BEV grid/z-bin/gate settings.
+- Previous failed score-improvement experiment:
+  - Selected idea: PLDD / Privileged Lane-Depth Distillation.
+  - Rationale: ETAM was the strongest temporal architecture direction, but the current remote dataset mount does not include `prev_data_release`, and single-frame cache files do not contain enough ego-motion information to reconstruct trustworthy temporal pose alignment. To keep the new round in the “big innovation” regime without fabricating incorrect temporal geometry, this experiment pivots to training-time privileged depth supervision: use OpenLane's existing 3D lane annotations and camera matrices to generate low-resolution lane occupancy, inverse-depth, and height teacher targets, so the visual backbone can learn stronger 3D structure while inference remains pure monocular vision.
+  - Code: `mmseg/models/lane_detector/anchor_3dlane_pp.py` temporarily added optional `priv_depth_distill`, a light `priv_depth_head`, online teacher-target generation, and `loss_priv_depth` that is only active during training. Failed code and config must stay rolled back.
+  - Config: `configs_v2/openlane/experiments/anchor3dlane++_r50x2_pldd.py`, loading `output/openlane/experiments/vdcc_r50x2/iter_10000.pth`, `samples_per_gpu=3`, `lr=1e-5`, `max_iters=10000`, keeping `curve_geom_losses=0.05` and adding `priv_depth_loss_weight=0.03`; failed config must stay removed.
+  - Validation before formal training: local `py_compile` and `git diff --check` passed; remote config/model/checkpoint load passed with only expected missing keys `priv_depth_head.weight` and `priv_depth_head.bias`; 1-iter and 20-iter 2-GPU DDP smoke passed with finite loss/grad, `loss_priv_depth` visible in logs, memory about `27.4GB`, and no OOM/NaN/Traceback/DDP error.
+  - Formal training and validation completed:
+    - Training log: `logs/train_pldd_20260511_022504.log`.
+    - Evaluation log: `logs/eval_pldd_20260511_032101.log`.
+    - Result file: `output/openlane/experiments/pldd_r50x2_eval/evaluation_result.json`.
+    - Metrics: F1 `0.6246791574684367`, recall `0.613967887127032`, precision `0.6357708009682431`, category accuracy `0.9356250816703691`.
+  - Decision: PLDD improves over official baseline but regresses below current stable F1 `0.6254260715979268`; do not record it in `docs/实验记录.md`, keep only the failure analysis in `docs/失败路线.md`, and avoid repeating standalone annotation-derived depth/height auxiliary supervision on the final image feature.
+- Previous successful score-improvement experiment:
   - Selected idea: V-DCC / Visibility-weighted Differential Curve Consistency.
   - Rationale: `strip_sample` improved local image evidence but still regresses 3D lanes point-by-point. V-DCC adds a final-only, visibility-masked first/second differential curve consistency loss against GT x-curve geometry, using real y-step spacing. It does not add proposals, feature sampling freedom, matcher changes, confidence calibration, visibility BCE, or learned anchor priors.
   - Research: three `gpt-5.5 xhigh` subagents proposed V-DCC, GSPR, and PUME. V-DCC was selected first because it is a pure geometry-supervision signal with no new model parameters and the lowest risk of hurting precision through extra texture aggregation.
@@ -56,6 +262,20 @@
   - Result file: `output/openlane/experiments/vdcc_r50x2_eval/evaluation_result.json`.
   - Decision: improved over current stable `strip_sample` F1 `0.6252112086013109`; keep the implementation, record it in `docs/实验记录.md`, and commit/push this stable version.
 - Completed score-improvement experiments:
+  - `rcl` added final-only Refinement Contraction Loss on top of the stable `vdcc` checkpoint.
+  - Formal 2-GPU training completed from `logs/train_rcl_20260511_002303.log` and produced `output/openlane/experiments/rcl_r50x2/iter_10000.pth`.
+  - Formal validation evaluation completed from `logs/eval_rcl_clean_20260511_012426.log`.
+  - Result file: `/root/autodl-tmp/Anchor3DLane-pp/output/openlane/experiments/rcl_r50x2_eval/evaluation_result.json`.
+  - Metrics: F1 `0.6244708671489517`, recall `0.6112930032169938`, precision `0.6382294089016278`, category accuracy `0.9347680080595512`.
+  - Decision: improved over official baseline but regressed below current stable F1 `0.6254260715979268`; failed implementation code and config must stay rolled back, and the failure is documented in `docs/失败路线.md`.
+  - Avoid repeating standalone refinement contraction loss or only tuning `refine_contract_margin` / `refine_contract_losses`.
+  - `vdcc_gds` added final-only Visibility-aware Geometric Decoy Suppression on top of the stable `vdcc` checkpoint.
+  - Formal 2-GPU training completed from `logs/train_vdcc_gds_20260510_225752.log` and produced `output/openlane/experiments/vdcc_gds_r50x2/iter_10000.pth`.
+  - Formal validation evaluation completed from `logs/eval_vdcc_gds_20260510_235341.log`.
+  - Result file: `/root/autodl-tmp/Anchor3DLane-pp/output/openlane/experiments/vdcc_gds_r50x2_eval/evaluation_result.json`.
+  - Metrics: F1 `0.6238212537003857`, recall `0.6146954555505625`, precision `0.6332220992897677`, category accuracy `0.93148480420266`.
+  - Decision: regressed below current stable F1 `0.6254260715979268` and official baseline F1 `0.6240448139487519`; failed implementation code and config must stay rolled back, and the failure is documented in `docs/失败路线.md`.
+  - Avoid repeating standalone near-GT geometric decoy suppression or only tuning `geo_decoy_tube`, `geo_decoy_topk_factor`, `geo_decoy_min_vis`, or `geo_decoy_losses`.
   - `far_semantic_fuse` added a zero-initialized far-range semantic residual from `anchor_feats[1]` only at `y >= 40m` on the final feature level and final refinement.
   - Formal 2-GPU training completed from `logs/train_far_semantic_fuse_20260510_195436.log` and produced `output/openlane/experiments/far_semantic_fuse_r50x2/iter_10000.pth`.
   - Formal validation evaluation completed from `logs/eval_far_semantic_fuse_20260510_204903.log`.
@@ -95,7 +315,7 @@
   - Remote config load passed with `samples_per_gpu=2`, `max_iters=10000`, `cost_eval=0.5`, `cost_vis=0.0`, loading `checkpoints/Openlane/openlane_anchor3dlane++_r50x2.pth`.
   - Remote matcher sanity passed: default matcher output equals the previous cost formula; enabled eval cost returns finite `[30, 6]` matrices.
   - Remote 2-GPU DDP smoke passed for 1 and 20 iterations. The 20-iter run had finite losses and gradients, logged memory about 24.7GB, and no OOM/Traceback/NaN.
-- Latest failed score-improvement experiment:
+- Older failed score-improvement experiment:
   - Selected idea: geometry-normal strip residual fusion.
   - Rationale: `strip_sample` only samples horizontal image offsets. This experiment keeps the stable horizontal strip branch and adds a geometry-derived normal-direction strip branch along the projected lane curve, fused by one global scalar gate. It does not use content-based per-point offset weights.
   - Code: `mmseg/models/lane_detector/anchor_3dlane_pp.py` temporarily added optional `strip_normal_sample` and `strip_normal_alpha_logit`; failed code has been rolled back, preserving stable `strip_sample`.

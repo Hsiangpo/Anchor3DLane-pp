@@ -21,12 +21,15 @@ from mmseg.datasets.tools.vis_openlane import LaneVis
 
 def postprocess(output, anchor_len=10, use_sigmoid=False):
     proposals = output[0]
+    calibrated_scores = output[3] if len(output) > 3 else None
     if use_sigmoid:
         logits = torch.sigmoid(proposals[:, 5 + 3 * anchor_len:])  # [N, C]
         scores = torch.max(logits, dim=1)[0]
     else:
         logits = F.softmax(proposals[:, 5 + 3 * anchor_len:], dim=1)
         scores = 1 - logits[:, 0]  # [N]
+    if calibrated_scores is not None:
+        scores = calibrated_scores
     proposals[:, 5 + 3 * anchor_len:] = logits  # [N, 2]
     proposals[:, 1] = scores
     results = {'proposals_list': proposals.cpu().numpy()}

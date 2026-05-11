@@ -36,6 +36,17 @@ class LaneLossV2(nn.Module):
                  curve_geom_axes=('x',),
                  curve_slope_weight=1.0,
                  curve_curv_weight=0.4,
+                 accept_vis_thresh=0.7,
+                 accept_dist_thresh=1.5,
+                 accept_cover_thresh=0.75,
+                 accept_purity_thresh=0.75,
+                 accept_neg_cover_thresh=0.5,
+                 accept_neg_purity_thresh=0.5,
+                 accept_hard_score_thresh=0.35,
+                 accept_pos_weight=1.0,
+                 accept_neg_weight=1.0,
+                 dup_rank_margin=0.1,
+                 dup_rank_max_pairs=4,
                  assign_cfg=None):
         super(LaneLossV2, self).__init__()
         self.focal_alpha = focal_alpha
@@ -51,11 +62,24 @@ class LaneLossV2(nn.Module):
         self.lane_prior = 'reg_losses_prior' in loss_weights.keys()
         self.consist = ('consist_losses' in loss_weights.keys())
         self.curve_geom = ('curve_geom_losses' in loss_weights.keys())
+        self.accept_calib = ('accept_calib_losses' in loss_weights.keys())
+        self.dup_rank = ('dup_rank_losses' in loss_weights.keys())
         self.curve_geom_axes = tuple(curve_geom_axes)
         assert len(self.anchor_steps) == self.anchor_len
         assert set(self.curve_geom_axes).issubset({'x', 'z'})
         self.curve_slope_weight = float(curve_slope_weight)
         self.curve_curv_weight = float(curve_curv_weight)
+        self.accept_vis_thresh = float(accept_vis_thresh)
+        self.accept_dist_thresh = float(accept_dist_thresh)
+        self.accept_cover_thresh = float(accept_cover_thresh)
+        self.accept_purity_thresh = float(accept_purity_thresh)
+        self.accept_neg_cover_thresh = float(accept_neg_cover_thresh)
+        self.accept_neg_purity_thresh = float(accept_neg_purity_thresh)
+        self.accept_hard_score_thresh = float(accept_hard_score_thresh)
+        self.accept_pos_weight = float(accept_pos_weight)
+        self.accept_neg_weight = float(accept_neg_weight)
+        self.dup_rank_margin = float(dup_rank_margin)
+        self.dup_rank_max_pairs = int(dup_rank_max_pairs)
         self.register_buffer('anchor_y_steps_tensor',
                              torch.as_tensor(anchor_steps, dtype=torch.float32),
                              persistent=False)
@@ -107,6 +131,135 @@ class LaneLossV2(nn.Module):
         if not losses:
             return self.zero_loss(x_pred)
         return sum(losses) / len(losses)
+
+    def proposal_scores(self, proposals):
+        cls_logits = proposals[:, 5 + self.anchor_len * 3:]
+        if self.use_sigmoid:
+            return cls_logits.sigmoid().max(dim=1)[0]
+        return 1 - cls_logits.softmax(dim=1)[:, 0]
+
+    def refined_visibility_mask(self, vis_pred):
+        visible = vis_pred >= self.accept_vis_thresh
+        flag_l = visible.cumsum(dim=1)
+        flag_r = visible.flip(dims=[1]).cumsum(dim=1).flip(dims=[1])
+        return (flag_l > 0) & (flag_r > 0)
+
+    def acceptance_labels(self, proposals, target):
+        num_props = proposals.shape[0]
+        device = proposals.device
+        labels = proposals.new_zeros(num_props)
+        valid = torch.zeros(num_props, dtype=torch.bool, device=device)
+        accepted = torch.zeros(num_props, dtype=torch.bool, device=device)
+        best_target = torch.full((num_props,), -1, dtype=torch.long, device=device)
+        best_cost = proposals.new_full((num_props,), 1e6)
+        base_scores = self.proposal_scores(proposals)
+
+        if target.shape[0] == 0:
+            hard_neg = base_scores > self.accept_hard_score_thresh
+            valid[hard_neg] = True
+            return labels, valid, accepted, best_target, best_cost
+
+        x_pred = proposals[:, 5:5+self.anchor_len]
+        z_pred = proposals[:, 5+self.anchor_len:5+self.anchor_len*2]
+        vis_pred = proposals[:, 5+self.anchor_len*2:5+self.anchor_len*3]
+        pred_mask = self.refined_visibility_mask(vis_pred)
+        x_target = target[:, 5:5+self.anchor_len]
+        z_target = target[:, 5+self.anchor_len:5+self.anchor_len*2]
+        vis_target = target[:, 5+self.anchor_len*2:5+self.anchor_len*3] > 0.5
+
+        dist = ((x_pred[:, None, :] - x_target[None, :, :]) ** 2 +
+                (z_pred[:, None, :] - z_target[None, :, :]) ** 2).clamp_min(1e-8).sqrt()
+        pair_mask = pred_mask[:, None, :] & vis_target[None, :, :]
+        hit = (dist <= self.accept_dist_thresh) & pair_mask
+        hit_count = hit.to(proposals.dtype).sum(dim=2)
+        gt_visible = vis_target.to(proposals.dtype).sum(dim=1).clamp_min(1.0)
+        pred_visible = pred_mask.to(proposals.dtype).sum(dim=1).clamp_min(1.0)
+        cover = hit_count / gt_visible.view(1, -1)
+        purity = hit_count / pred_visible.view(-1, 1)
+        pair_accept = (cover >= self.accept_cover_thresh) & (purity >= self.accept_purity_thresh)
+
+        hit_cost = (dist * hit.to(dist.dtype)).sum(dim=2) / hit_count.clamp_min(1.0)
+        pair_cost = torch.where(pair_accept, hit_cost, dist.new_full(hit_cost.shape, 1e6))
+        min_cost, min_idx = pair_cost.min(dim=1)
+        accepted = pair_accept.any(dim=1)
+        labels[accepted] = 1.
+        valid[accepted] = True
+        best_target[accepted] = min_idx[accepted]
+        best_cost[accepted] = min_cost[accepted]
+
+        max_cover = cover.max(dim=1)[0]
+        max_purity = purity.max(dim=1)[0]
+        hard_neg = ((base_scores > self.accept_hard_score_thresh) &
+                    (max_cover < self.accept_neg_cover_thresh) &
+                    (max_purity < self.accept_neg_purity_thresh))
+        valid[hard_neg] = True
+        return labels, valid, accepted, best_target, best_cost
+
+    def duplicate_rank_loss(self, accept_logit, accepted, best_target, best_cost, target_count):
+        rank_losses = []
+        pair_count = accept_logit.new_tensor(0.)
+        for tgt_idx in range(target_count):
+            lane_mask = accepted & (best_target == tgt_idx)
+            if int(lane_mask.sum().item()) < 2:
+                continue
+            inds = lane_mask.nonzero(as_tuple=False).flatten()
+            order = best_cost[inds].argsort()
+            best = inds[order[0]]
+            others = inds[order[1:1+self.dup_rank_max_pairs]]
+            if others.numel() == 0:
+                continue
+            rank_losses.append(F.relu(self.dup_rank_margin + accept_logit[others] - accept_logit[best]).mean())
+            pair_count = pair_count + accept_logit.new_tensor(float(others.numel()))
+        if not rank_losses:
+            return self.zero_loss(accept_logit), pair_count
+        return sum(rank_losses) / len(rank_losses), pair_count
+
+    def accept_calibration_loss(self, proposals, target, accept_logit):
+        if accept_logit is None:
+            zero = self.zero_loss(proposals)
+            return zero, zero, zero, zero, zero, zero
+
+        accept_logit = accept_logit.reshape(-1)
+        with torch.no_grad():
+            labels, valid, accepted, best_target, best_cost = self.acceptance_labels(
+                proposals.detach(), target.detach())
+        if bool(valid.any()):
+            weights = torch.where(labels[valid] > 0.5,
+                                  accept_logit.new_tensor(self.accept_pos_weight),
+                                  accept_logit.new_tensor(self.accept_neg_weight))
+            bce = F.binary_cross_entropy_with_logits(
+                accept_logit[valid], labels[valid], reduction='none')
+            accept_loss = (bce * weights).sum() / weights.sum().clamp_min(1.0)
+        else:
+            accept_loss = self.zero_loss(accept_logit)
+
+        if self.dup_rank:
+            rank_loss, rank_pairs = self.duplicate_rank_loss(
+                accept_logit, accepted, best_target, best_cost, target.shape[0])
+        else:
+            rank_loss = self.zero_loss(accept_logit)
+            rank_pairs = accept_logit.new_tensor(0.)
+
+        pos_count = accepted.to(accept_logit.dtype).sum()
+        neg_count = (valid & ~accepted).to(accept_logit.dtype).sum()
+        ignore_count = (~valid).to(accept_logit.dtype).sum()
+        return accept_loss, rank_loss, pos_count, neg_count, ignore_count, rank_pairs
+
+    def init_accept_stats(self, proposals):
+        zero = proposals.new_tensor(0.)
+        return dict(loss=zero, rank_loss=zero, pos=zero, neg=zero, ignore=zero, rank_pairs=zero)
+
+    def update_accept_stats(self, stats, proposals, target, accept_logit):
+        if stats is None:
+            return
+        accept_loss, rank_loss, pos_count, neg_count, ignore_count, rank_pairs = \
+            self.accept_calibration_loss(proposals, target, accept_logit)
+        stats['loss'] = stats['loss'] + accept_loss
+        stats['rank_loss'] = stats['rank_loss'] + rank_loss
+        stats['pos'] = stats['pos'] + pos_count
+        stats['neg'] = stats['neg'] + neg_count
+        stats['ignore'] = stats['ignore'] + ignore_count
+        stats['rank_pairs'] = stats['rank_pairs'] + rank_pairs
         
     def forward(self, proposals_list, targets):
         if self.use_sigmoid:
@@ -124,6 +277,7 @@ class LaneLossV2(nn.Module):
             consist_losses = 0 
         if self.curve_geom:
             curve_geom_losses = 0
+        accept_stats = self.init_accept_stats(proposals_list[0][0]) if self.accept_calib else None
         valid_imgs = len(targets)
         total_positives = 0
         total_negatives = 0
@@ -131,10 +285,13 @@ class LaneLossV2(nn.Module):
             proposals = proposals_list[idx][0]
             num_clses = proposals.shape[1] - 5 - self.anchor_len * 3
             anchors = proposals_list[idx][1]
+            accept_logit = proposals_list[idx][2] if len(proposals_list[idx]) > 2 else None
             target = targets[idx]
             # Filter lanes that do not exist (confidence == 0)
             target = target[target[:, 1] > 0]   # [N, 605]
             if len(target) == 0:
+                empty_target = proposals.new_zeros((0, 5 + self.anchor_len * 3))
+                self.update_accept_stats(accept_stats, proposals, empty_target, accept_logit)
                 # If there are no targets, all proposals have to be negatives (i.e., 0 confidence)
                 cls_target = proposals.new_zeros(len(proposals)).long()
                 cls_pred = proposals[:, 5+self.anchor_len*3:]
@@ -157,6 +314,7 @@ class LaneLossV2(nn.Module):
             z_target = target.index_select(1, z_indices)
             vis_target = target.index_select(1, vis_indices)   # [N, 10]
             target = torch.cat((target[:, :5], x_target, z_target, vis_target), dim=1)   # [N, 35]
+            self.update_accept_stats(accept_stats, proposals, target, accept_logit)
             with torch.no_grad():
                 if self.anchor_assign:
                     anchor_assign = torch.cat([anchors, proposals[:, 65:]], 1)
@@ -262,9 +420,22 @@ class LaneLossV2(nn.Module):
         if self.curve_geom:
             curve_geom_losses = curve_geom_losses / valid_imgs
             losses['curve_geom_losses'] = curve_geom_losses
+        if self.accept_calib:
+            accept_calib_losses = accept_stats['loss'] / valid_imgs
+            losses['accept_calib_losses'] = accept_calib_losses
+        if self.dup_rank:
+            dup_rank_losses = accept_stats['rank_loss'] / valid_imgs
+            losses['dup_rank_losses'] = dup_rank_losses
 
         for k in losses.keys():
             losses[k] = losses[k] * self.loss_weights[k]
 
         bs = len(proposals_list)
-        return {'losses':losses, 'batch_positives': total_positives / bs, 'batch_negatives': total_negatives / bs}
+        result = {'losses':losses, 'batch_positives': total_positives / bs, 'batch_negatives': total_negatives / bs}
+        if self.accept_calib:
+            result['batch_accept_pos'] = accept_stats['pos'] / bs
+            result['batch_accept_neg'] = accept_stats['neg'] / bs
+            result['batch_accept_ignore'] = accept_stats['ignore'] / bs
+        if self.dup_rank:
+            result['batch_dup_rank_pairs'] = accept_stats['rank_pairs'] / bs
+        return result

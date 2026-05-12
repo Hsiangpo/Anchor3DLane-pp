@@ -1,4 +1,4 @@
-[系统状态]：Anchor3DLane-pp is deployed and the official checkpoint baseline is reproduced on OpenLane validation, current stable F1 = 62.595; latest successful experiment is `pgb_od`; latest failed experiment is `brf_lpf`; current running experiment is none; ApolloSim is not mounted yet.
+[系统状态]：Anchor3DLane-pp is deployed and the official checkpoint baseline is reproduced on OpenLane validation, current stable F1 = 62.610; latest successful experiment is `ptef`; latest failed experiment is `brf_lpf`; current running experiment is none; ApolloSim is not mounted yet.
 
 # Anchor3DLane-pp Agent Notes
 
@@ -35,12 +35,24 @@
   - Result file: `/root/autodl-tmp/Anchor3DLane-pp/output/openlane/baseline_eval/evaluation_result.json`
   - Metrics: F1 `0.6240448139487519`, recall `0.613268850798542`, precision `0.6352062468171787`, category accuracy `0.9337897428296154`.
 - Current stable score:
-  - Experiment: `strip_sample + vdcc + eac_dr + frt_eat + lpf_t + lof_oc + lef_dff + pgb_od` / Privileged Geometry BEV-Ownership Distillation.
-  - Result file: `/root/autodl-tmp/Anchor3DLane-pp/output/openlane/experiments/pgb_od_r50x2_eval/evaluation_result.json`.
-  - Metrics: F1 `0.6259549379339562`, recall `0.6167996975597926`, precision `0.6353860581431697`, category accuracy `0.9348642697211377`.
-  - Improvement over previous stable `strip_sample + vdcc + eac_dr + frt_eat + lpf_t + lof_oc + lef_dff`: `+0.0001553125731022` F1, or `+0.015531` points on the 0-100 reporting scale.
-  - Improvement over official checkpoint baseline: `+0.0019101239852043` F1, or `+0.191012` points on the 0-100 reporting scale.
+  - Experiment: `strip_sample + vdcc + eac_dr + frt_eat + lpf_t + lof_oc + lef_dff + pgb_od + ptef` / Projection-Tube Evidence Field.
+  - Result file: `/root/autodl-tmp/Anchor3DLane-pp/output/openlane/experiments/ptef_r50x2_eval/evaluation_result.json`.
+  - Metrics: F1 `0.6260965689592046`, recall `0.6172847431754795`, precision `0.6351636181766219`, category accuracy `0.935150488985113`.
+  - Improvement over previous stable `strip_sample + vdcc + eac_dr + frt_eat + lpf_t + lof_oc + lef_dff + pgb_od`: `+0.0001416310252484` F1, or `+0.014163` points on the 0-100 reporting scale.
+  - Improvement over official checkpoint baseline: `+0.0020517550104527` F1, or `+0.205176` points on the 0-100 reporting scale.
 - Latest successful score-improvement experiment:
+  - Selected idea: PTEF / Projection-Tube Evidence Field.
+  - Rationale: PGB-OD shows metric BEV evidence can add a small recall-oriented gain, but a single center projection sample can still miss thin lane evidence when monocular geometry or calibration is slightly off. PTEF keeps the 30-proposal path, matcher, NMS, thresholds, PGB-OD, LEF-DFF, LOF-OC, and LPF-T unchanged, then samples a fixed 3D meter-scale evidence tube around each proposal point: lateral `x` offsets `[-0.5, -0.25, 0.25, 0.5]m` and vertical `z` offsets `[-0.3, 0.3]m` projected through the real camera matrix. This is a constrained physical uncertainty model, not free deformable attention.
+  - Code: `mmseg/models/lane_detector/field/lane_evidence_field.py` adds optional `tube_enabled` sampling and `batch_tube_*` metrics; config is `configs_v2/openlane/experiments/anchor3dlane++_r50x2_ptef.py`, loading `output/openlane/experiments/pgb_od_r50x2/iter_10000.pth`.
+  - Validation before formal training: local and remote `py_compile` and `git diff --check` passed; code review subagents gave PASS/FINAL PASS; remote config/model/checkpoint load passed with missing keys only `lane_evidence_field.tube_sample_proj.*`, `unexpected=[]`; CUDA shape sanity produced tube logits `[2,7,30,20]`, masked invalid points correctly, and initial delta `0.0`; remote 2-GPU DDP 1-iter and 20-iter smoke passed with memory about `18977MB`, finite `batch_tube_*`, finite losses/grad, and no OOM/NaN/Traceback/Killed/DDP hard error.
+  - Formal training and validation completed:
+    - Training log: `logs/train_ptef_20260512_143223.log`.
+    - Final checkpoint: `output/openlane/experiments/ptef_r50x2/iter_10000.pth`.
+    - Evaluation log: `logs/eval_ptef_20260512_150754.log`.
+    - Result file: `output/openlane/experiments/ptef_r50x2_eval/evaluation_result.json`.
+    - Metrics: F1 `0.6260965689592046`, recall `0.6172847431754795`, precision `0.6351636181766219`, category accuracy `0.935150488985113`.
+  - Decision: PTEF improves over previous stable PGB-OD F1 `0.6259549379339562` and official baseline F1 `0.6240448139487519`; keep the implementation, record it in `docs/实验记录.md`, and commit/push this stable version. The minimum target F1 > 65 is still not reached. The gain is still small, so the next iteration should pivot to a larger architecture-level idea such as SCD-CC shadow candidates or MRB-SDF road-ribbon quality reranking.
+- Previous successful score-improvement experiment:
   - Selected idea: PGB-OD / Privileged Geometry BEV-Ownership Distillation.
   - Rationale: LEF-DFF confirmed that dense projected lane evidence can help precision, but the gain is tiny and still single-image/single-view. PGB-OD extends the same field with a lightweight BEV teacher from OpenLane 3D GT: it predicts a low-resolution BEV lane evidence map from image features, supervises it with GT 3D lane occupancy, and samples that BEV evidence back into the existing final proposal tokens. It keeps the 30-proposal path, matcher, NMS, thresholds, LPF-T, LOF-OC, LEF-DFF, and accept calibration behavior unchanged.
   - Code: `mmseg/models/lane_detector/field/lane_evidence_field.py` now supports optional `bev_enabled` BEV evidence logits, BEV GT target generation, BEV token sampling, and `bev_evidence_loss`; `mmseg/models/lane_detector/anchor_3dlane_pp.py` only passes normalized proposal geometry into the existing field; config is `configs_v2/openlane/experiments/anchor3dlane++_r50x2_pgb_od.py`.

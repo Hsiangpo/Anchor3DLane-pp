@@ -23,7 +23,10 @@ class LaneEvidenceField(nn.Module):
                  bev_x_min=-10.0,
                  bev_x_max=10.0,
                  bev_y_min=3.0,
-                 bev_y_max=103.0):
+                 bev_y_max=103.0,
+                 tube_enabled=False,
+                 tube_x_offsets=(-0.5, -0.25, 0.25, 0.5),
+                 tube_z_offsets=(-0.3, 0.3)):
         super(LaneEvidenceField, self).__init__()
         self.detach_sample = bool(detach_sample)
         self.loss_weight = float(loss_weight)
@@ -40,6 +43,7 @@ class LaneEvidenceField(nn.Module):
         self.bev_x_max = float(bev_x_max)
         self.bev_y_min = float(bev_y_min)
         self.bev_y_max = float(bev_y_max)
+        self.tube_enabled = bool(tube_enabled)
         self.gate_logit = nn.Parameter(torch.tensor(float(gate_init)))
         hidden_channels = int(hidden_channels)
         self.evidence_head = nn.Sequential(
@@ -62,6 +66,17 @@ class LaneEvidenceField(nn.Module):
         else:
             self.bev_head = None
             self.bev_sample_proj = None
+        if self.tube_enabled:
+            offsets = self.build_tube_offsets(tube_x_offsets, tube_z_offsets)
+            self.register_buffer(
+                'tube_offsets', torch.tensor(offsets, dtype=torch.float32),
+                persistent=False)
+            self.tube_sample_proj = nn.Sequential(
+                nn.Conv2d(len(offsets), token_channels, 1),
+                nn.GELU(),
+                nn.Conv2d(token_channels, token_channels, 1))
+        else:
+            self.tube_sample_proj = None
         self.out_norm = nn.LayerNorm(token_channels)
         self.out_proj = nn.Linear(token_channels, token_channels)
         nn.init.constant_(self.evidence_head[-1].bias, -4.0)
@@ -71,8 +86,18 @@ class LaneEvidenceField(nn.Module):
             nn.init.constant_(self.bev_head[-1].bias, -4.0)
             nn.init.zeros_(self.bev_sample_proj[-1].weight)
             nn.init.zeros_(self.bev_sample_proj[-1].bias)
+        if self.tube_enabled:
+            nn.init.zeros_(self.tube_sample_proj[-1].weight)
+            nn.init.zeros_(self.tube_sample_proj[-1].bias)
         nn.init.zeros_(self.out_proj.weight)
         nn.init.zeros_(self.out_proj.bias)
+
+    @staticmethod
+    def build_tube_offsets(tube_x_offsets, tube_z_offsets):
+        offsets = [(0.0, 0.0)]
+        offsets.extend((float(offset), 0.0) for offset in tube_x_offsets)
+        offsets.extend((0.0, float(offset)) for offset in tube_z_offsets)
+        return offsets
 
     def geometry_to_bev_grid(self, geometry):
         x_norm, y_norm, _ = self.geometry_norm
@@ -122,6 +147,47 @@ class LaneEvidenceField(nn.Module):
         return bev_features * valid.reshape(
             batch_size, 1, self.bev_height, self.bev_width).to(dtype)
 
+    def build_tube_samples(self, evidence_logits, geometry, project_matrixes):
+        if project_matrixes is None:
+            return None, None
+        x_norm, y_norm, z_norm = self.geometry_norm
+        batch_size, _, height, width = evidence_logits.shape
+        offsets = self.tube_offsets.to(device=geometry.device, dtype=geometry.dtype)
+        raw_x = geometry[..., 0] * x_norm
+        raw_y = geometry[..., 1] * y_norm
+        raw_z = geometry[..., 2] * z_norm
+        sample_x = raw_x[..., None] + offsets[:, 0]
+        sample_y = raw_y[..., None].expand_as(sample_x)
+        sample_z = raw_z[..., None] + offsets[:, 1]
+        flat_x = sample_x.reshape(batch_size, -1)
+        flat_y = sample_y.reshape(batch_size, -1)
+        flat_z = sample_z.reshape(batch_size, -1)
+        ones = torch.ones_like(flat_z)
+        coordinates = torch.stack([flat_x, flat_y, flat_z, ones], dim=1)
+        trans = torch.bmm(
+            project_matrixes.to(device=geometry.device, dtype=geometry.dtype),
+            coordinates)
+        depth = trans[:, 2, :]
+        us = trans[:, 0, :] / depth.clamp_min(1e-6)
+        vs = trans[:, 1, :] / depth.clamp_min(1e-6)
+        norm_u = (us / width - 0.5) * 2.
+        norm_v = (vs / height - 0.5) * 2.
+        valid = (depth > 1e-6) & torch.isfinite(norm_u) & torch.isfinite(norm_v)
+        valid = valid & (norm_u > -1.) & (norm_u < 1.)
+        valid = valid & (norm_v > -1.) & (norm_v < 1.)
+        norm_u = torch.where(valid, norm_u, norm_u.new_full(norm_u.shape, 2.))
+        norm_v = torch.where(valid, norm_v, norm_v.new_full(norm_v.shape, 2.))
+        grid = torch.stack([norm_u, norm_v], dim=-1)
+        num_lanes, num_points = geometry.shape[1], geometry.shape[2]
+        grid = grid.reshape(batch_size, num_lanes, num_points * len(offsets), 2)
+        sampled = F.grid_sample(
+            evidence_logits, grid, padding_mode='zeros', align_corners=False)
+        sampled = sampled.reshape(batch_size, 1, num_lanes, num_points, len(offsets))
+        sampled = sampled.permute(0, 4, 2, 3, 1).squeeze(-1).contiguous()
+        valid = valid.reshape(batch_size, num_lanes, num_points, len(offsets))
+        valid = valid.permute(0, 3, 1, 2).contiguous()
+        return sampled * valid.to(sampled.dtype), valid
+
     def forward(self, tokens, dense_features, grid_us, grid_vs,
                 valid_mask=None, geometry=None, project_matrixes=None):
         batch_size, channels, num_lanes, num_points = tokens.shape
@@ -151,6 +217,20 @@ class LaneEvidenceField(nn.Module):
             bev_embed = self.bev_sample_proj(bev_for_fuse)
             bev_embed = bev_embed * bev_valid[:, None].to(bev_embed.dtype)
             evidence_embed = evidence_embed + bev_embed
+        tube_sampled = None
+        tube_valid = None
+        if self.tube_enabled and geometry is not None:
+            tube_sampled, tube_valid = self.build_tube_samples(
+                evidence_logits, geometry, project_matrixes)
+            if tube_sampled is not None:
+                if valid_mask is not None:
+                    tube_valid = tube_valid & valid_mask[:, None]
+                    tube_sampled = tube_sampled * tube_valid.to(tube_sampled.dtype)
+                tube_for_fuse = tube_sampled.detach() if self.detach_sample else tube_sampled
+                tube_embed = self.tube_sample_proj(tube_for_fuse)
+                if valid_mask is not None:
+                    tube_embed = tube_embed * valid_mask[:, None].to(tube_embed.dtype)
+                evidence_embed = evidence_embed + tube_embed
         point_tokens = tokens + evidence_embed
         point_tokens = point_tokens.permute(0, 2, 3, 1).contiguous()
         residual = self.out_proj(self.out_norm(point_tokens))
@@ -158,7 +238,12 @@ class LaneEvidenceField(nn.Module):
         if valid_mask is not None:
             residual = residual * valid_mask[:, None].to(residual.dtype)
         tokens = tokens + self.gate_logit.sigmoid().to(tokens.dtype) * residual
-        logits = {'image': evidence_logits, 'bev': bev_logits}
+        logits = {
+            'image': evidence_logits,
+            'bev': bev_logits,
+            'tube': tube_sampled,
+            'tube_valid': tube_valid,
+        }
         return tokens, logits, sampled
 
     @staticmethod
@@ -275,8 +360,9 @@ class LaneEvidenceField(nn.Module):
     @staticmethod
     def unpack_logits(logits):
         if isinstance(logits, dict):
-            return logits.get('image'), logits.get('bev')
-        return logits, None
+            return (logits.get('image'), logits.get('bev'), logits.get('tube'),
+                    logits.get('tube_valid'))
+        return logits, None, None, None
 
     def loss(self, logits_all, gt_3dlanes, gt_project_matrix, project_builder,
              y_max):
@@ -286,12 +372,17 @@ class LaneEvidenceField(nn.Module):
         total_prob = 0.
         total_bev_pos = 0.
         total_bev_prob = 0.
+        total_tube_valid = 0.
+        total_tube_center_prob = 0.
+        total_tube_max_prob = 0.
         count = 0
         bev_count = 0
+        tube_count = 0
         metric_batch_size = None
         for iter_logits in logits_all:
             for logits in iter_logits:
-                evidence_logits, bev_logits = self.unpack_logits(logits)
+                evidence_logits, bev_logits, tube_logits, tube_valid = (
+                    self.unpack_logits(logits))
                 if (evidence_logits is None or gt_project_matrix is None or
                         project_builder is None):
                     image_loss = None
@@ -324,6 +415,19 @@ class LaneEvidenceField(nn.Module):
                     total_bev_prob += bev_logits.sigmoid().mean().detach()
                     metric_batch_size = bev_logits.shape[0]
                     bev_count += 1
+                if tube_logits is not None and tube_valid is not None:
+                    valid = tube_valid.to(tube_logits.dtype)
+                    point_valid = valid.max(dim=1, keepdim=True).values
+                    tube_prob = tube_logits.sigmoid()
+                    total_tube_valid += (valid.sum() / max(float(tube_logits.shape[0]), 1.0)).detach()
+                    total_tube_center_prob += (
+                        (tube_prob[:, :1] * valid[:, :1]).sum() /
+                        valid[:, :1].sum().clamp_min(1.)).detach()
+                    total_tube_max_prob += (
+                        (tube_prob.max(dim=1, keepdim=True).values * point_valid).sum() /
+                        point_valid.sum().clamp_min(1.)).detach()
+                    metric_batch_size = tube_logits.shape[0]
+                    tube_count += 1
         if count == 0 and bev_count == 0:
             return {}, {}
         if gt_3dlanes is None:
@@ -344,4 +448,8 @@ class LaneEvidenceField(nn.Module):
             metrics['batch_bev_evidence_pos'] = (
                 total_bev_pos / max(float(batch_size), 1.0))
             metrics['batch_bev_evidence_prob'] = total_bev_prob / bev_count
+        if tube_count > 0:
+            metrics['batch_tube_valid'] = total_tube_valid / tube_count
+            metrics['batch_tube_center_prob'] = total_tube_center_prob / tube_count
+            metrics['batch_tube_max_prob'] = total_tube_max_prob / tube_count
         return losses, metrics

@@ -1,4 +1,4 @@
-[系统状态]：Anchor3DLane-pp is deployed and the official checkpoint baseline is reproduced on OpenLane validation, current stable F1 = 62.610; latest successful experiment is `ptef`; latest failed experiment is `brf_lpf`; current running experiment is none; ApolloSim is not mounted yet.
+[系统状态]：Anchor3DLane-pp is deployed and the official checkpoint baseline is reproduced on OpenLane validation, current stable F1 = 62.610; archived TSP-LDT branch F1 = 62.627; latest successful experiment is `ptef`; latest archived non-stable experiment is `tsp_ldt`; current running experiment is none; ApolloSim is not mounted yet.
 
 # Anchor3DLane-pp Agent Notes
 
@@ -40,6 +40,30 @@
   - Metrics: F1 `0.6260965689592046`, recall `0.6172847431754795`, precision `0.6351636181766219`, category accuracy `0.935150488985113`.
   - Improvement over previous stable `strip_sample + vdcc + eac_dr + frt_eat + lpf_t + lof_oc + lef_dff + pgb_od`: `+0.0001416310252484` F1, or `+0.014163` points on the 0-100 reporting scale.
   - Improvement over official checkpoint baseline: `+0.0020517550104527` F1, or `+0.205176` points on the 0-100 reporting scale.
+- Archived non-stable architecture experiment:
+  - Selected idea: TSP-LDT / Temporal Self-Supervised Pseudo-LiDAR Distillation Teacher.
+  - Rationale: repeated proposal/loss/rerank changes are still producing tiny gains, and the remote cache lacks trustworthy ego-pose for true aligned temporal fusion. TSP-LDT instead builds an offline BEV/SDF/z/quality teacher from same-segment neighbor lane sets with strict self-alignment, then trains the single-frame model to sample that teacher field into final proposal tokens while keeping inference single-frame.
+  - Code status: preserved on archive branch `archive/tsp-ldt-f1-62.627`; the main stable branch should continue from PTEF unless this branch is intentionally revisited.
+  - Review status: code review and re-review passed after fixing missing-teacher handling, metric naming, and BEV feature reuse.
+  - Smoke status: remote 2-GPU smoke tests passed with finite loss/grad, `batch_tsp_valid=6144.0000`, `tsp_ldt_loss` visible, and no OOM/NaN/Traceback/DDP hard error. Conservative `samples_per_gpu=3` smoke used about `18977MB`; batch search then pushed the formal config to `samples_per_gpu=40`, and the 20-iter DDP smoke peaked at `29003 / 32607MB` on both RTX 5090 GPUs while staying stable.
+  - Teacher-cache status: full training teacher cache completed at `data/OpenLane/lane3d_1000_v1.3/tsp_ldt_cache` with `136496 / 136496` `.npz` files on 2026-05-12 19:53 CST.
+  - Formal training status: the first final checkpoint save failed because `/root/autodl-tmp` was full (`OSError: [Errno 28] No space left on device`). The corrupt checkpoint and completed smoke checkpoints were removed, then large checkpoints from already failed DAGS, PC-Aug, and MP-BFR experiments were removed while keeping logs/configs/results. Training was resumed from `iter_5000.pth`, regenerated a valid `iter_10000.pth`, and passed checkpoint load validation.
+  - Final validation result:
+    - Training log: `logs/train_tsp_ldt_20260512_195315.log`.
+    - Evaluation log: `logs/eval_tsp_ldt_valid_20260513_033304.log`.
+    - Result file: `output/openlane/experiments/tsp_ldt_r50x2_eval/evaluation_result.json`.
+    - Metrics: F1 `0.626269758244777`, recall `0.6182833665018939`, precision `0.634465171024004`, category accuracy `0.9350582147477361`.
+  - Decision: TSP-LDT is a real architecture-level innovation and produced a positive signal, but it only improves over PTEF by `+0.0001731892855724` F1 (`+0.017319` on the 0-100 scale). This is too small to treat as the stable mainline result for the F1 > 65 goal, so keep it archived and continue new major-innovation work from the PTEF stable branch.
+- Latest failed architecture experiment:
+  - Selected idea: SCD-CC / Shadow Candidate Distillation with Coverage-Constrained Commit.
+  - Rationale: SCD-CC is an architecture-level candidate-generation and distillation experiment, not a tuning-only change. It internally expands each public proposal into multiple shadow candidates, trains those shadows against evaluator-style coverage signals, and commits only a tiny gated residual back into the original 30 public proposals so extra candidates never enter final NMS directly.
+  - Training and validation completed on the remote server without OOM/NaN/Traceback:
+    - Training log: `logs/train_scd_cc_20260512_163501.log`.
+    - Final checkpoint: `output/openlane/experiments/scd_cc_r50x2/iter_10000.pth`.
+    - Eval log: `logs/eval_scd_cc_bg_20260512_171716.log`.
+    - Result file: `output/openlane/experiments/scd_cc_r50x2_eval/evaluation_result.json`.
+    - Metrics: F1 `0.6260829149193411`, recall `0.6172490780566791`, precision `0.6351732761700607`, category accuracy `0.9350982224648611`.
+  - Decision: SCD-CC regressed slightly below current stable PTEF F1 `0.6260965689592046`; failed code/config must stay rolled back and the failure is documented in `docs/失败路线.md`. Avoid repeating internal shadow candidates with only tiny residual commit-gate tuning.
 - Latest successful score-improvement experiment:
   - Selected idea: PTEF / Projection-Tube Evidence Field.
   - Rationale: PGB-OD shows metric BEV evidence can add a small recall-oriented gain, but a single center projection sample can still miss thin lane evidence when monocular geometry or calibration is slightly off. PTEF keeps the 30-proposal path, matcher, NMS, thresholds, PGB-OD, LEF-DFF, LOF-OC, and LPF-T unchanged, then samples a fixed 3D meter-scale evidence tube around each proposal point: lateral `x` offsets `[-0.5, -0.25, 0.25, 0.5]m` and vertical `z` offsets `[-0.3, 0.3]m` projected through the real camera matrix. This is a constrained physical uncertainty model, not free deformable attention.

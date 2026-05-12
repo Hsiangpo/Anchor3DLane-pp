@@ -68,6 +68,10 @@ class LaneFormat(object):
             results['gt_camera_height'] = DC(to_tensor([results['gt_camera_height']]))
         if 'prev_poses' in results:
             results['prev_poses'] = DC(to_tensor(np.stack(results['prev_poses'], axis=0).astype(np.float32)), stack=True)  # [Np, 3, 4]
+        if 'tsp_teacher' in results:
+            results['tsp_teacher'] = DC(to_tensor(results['tsp_teacher'].astype(np.float32)), stack=True)
+        if 'tsp_valid' in results:
+            results['tsp_valid'] = DC(to_tensor(results['tsp_valid'].astype(np.float32)), stack=True)
         if 'mask' in results:
             results['mask'] = DC(to_tensor(results['mask'][None, ...].astype(np.float32)), stack=True)
         if 'voxels' in results:

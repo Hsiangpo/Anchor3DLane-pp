@@ -26,7 +26,16 @@ class LaneEvidenceField(nn.Module):
                  bev_y_max=103.0,
                  tube_enabled=False,
                  tube_x_offsets=(-0.5, -0.25, 0.25, 0.5),
-                 tube_z_offsets=(-0.3, 0.3)):
+                 tube_z_offsets=(-0.3, 0.3),
+                 tsp_enabled=False,
+                 tsp_channels=4,
+                 tsp_loss_weight=0.02,
+                 tsp_occ_weight=1.0,
+                 tsp_sdf_weight=0.5,
+                 tsp_z_weight=0.2,
+                 tsp_quality_weight=0.5,
+                 tsp_pos_weight=8.0,
+                 allow_missing_tsp_teacher=False):
         super(LaneEvidenceField, self).__init__()
         self.detach_sample = bool(detach_sample)
         self.loss_weight = float(loss_weight)
@@ -44,6 +53,15 @@ class LaneEvidenceField(nn.Module):
         self.bev_y_min = float(bev_y_min)
         self.bev_y_max = float(bev_y_max)
         self.tube_enabled = bool(tube_enabled)
+        self.tsp_enabled = bool(tsp_enabled)
+        self.tsp_channels = int(tsp_channels)
+        self.tsp_loss_weight = float(tsp_loss_weight)
+        self.tsp_occ_weight = float(tsp_occ_weight)
+        self.tsp_sdf_weight = float(tsp_sdf_weight)
+        self.tsp_z_weight = float(tsp_z_weight)
+        self.tsp_quality_weight = float(tsp_quality_weight)
+        self.tsp_pos_weight = float(tsp_pos_weight)
+        self.allow_missing_tsp_teacher = bool(allow_missing_tsp_teacher)
         self.gate_logit = nn.Parameter(torch.tensor(float(gate_init)))
         hidden_channels = int(hidden_channels)
         self.evidence_head = nn.Sequential(
@@ -77,6 +95,18 @@ class LaneEvidenceField(nn.Module):
                 nn.Conv2d(token_channels, token_channels, 1))
         else:
             self.tube_sample_proj = None
+        if self.tsp_enabled:
+            self.tsp_head = nn.Sequential(
+                nn.Conv2d(feature_channels, hidden_channels, 3, padding=1),
+                nn.GELU(),
+                nn.Conv2d(hidden_channels, self.tsp_channels, 1))
+            self.tsp_sample_proj = nn.Sequential(
+                nn.Conv2d(self.tsp_channels, token_channels, 1),
+                nn.GELU(),
+                nn.Conv2d(token_channels, token_channels, 1))
+        else:
+            self.tsp_head = None
+            self.tsp_sample_proj = None
         self.out_norm = nn.LayerNorm(token_channels)
         self.out_proj = nn.Linear(token_channels, token_channels)
         nn.init.constant_(self.evidence_head[-1].bias, -4.0)
@@ -89,6 +119,10 @@ class LaneEvidenceField(nn.Module):
         if self.tube_enabled:
             nn.init.zeros_(self.tube_sample_proj[-1].weight)
             nn.init.zeros_(self.tube_sample_proj[-1].bias)
+        if self.tsp_enabled:
+            nn.init.constant_(self.tsp_head[-1].bias, -2.0)
+            nn.init.zeros_(self.tsp_sample_proj[-1].weight)
+            nn.init.zeros_(self.tsp_sample_proj[-1].bias)
         nn.init.zeros_(self.out_proj.weight)
         nn.init.zeros_(self.out_proj.bias)
 
@@ -198,10 +232,10 @@ class LaneEvidenceField(nn.Module):
             evidence_logits, grid, padding_mode='zeros', align_corners=False)
         sampled_for_fuse = sampled.detach() if self.detach_sample else sampled
         evidence_embed = self.sample_proj(sampled_for_fuse)
+        bev_features = None
         bev_logits = None
         if self.bev_enabled and geometry is not None:
-            bev_features = self.build_metric_bev_features(
-                dense_features, project_matrixes)
+            bev_features = self.build_metric_bev_features(dense_features, project_matrixes)
             if bev_features is None:
                 bev_features = F.interpolate(
                     dense_features,
@@ -231,6 +265,29 @@ class LaneEvidenceField(nn.Module):
                 if valid_mask is not None:
                     tube_embed = tube_embed * valid_mask[:, None].to(tube_embed.dtype)
                 evidence_embed = evidence_embed + tube_embed
+        tsp_logits = None
+        if self.tsp_enabled and geometry is not None:
+            tsp_features = bev_features
+            if tsp_features is None:
+                tsp_features = self.build_metric_bev_features(
+                    dense_features, project_matrixes)
+            if tsp_features is None:
+                tsp_features = F.interpolate(
+                    dense_features,
+                    size=(self.bev_height, self.bev_width),
+                    mode='bilinear',
+                    align_corners=False)
+            tsp_logits = self.tsp_head(tsp_features)
+            tsp_grid, tsp_valid = self.geometry_to_bev_grid(
+                geometry.detach() if self.detach_sample else geometry)
+            tsp_sampled = F.grid_sample(
+                tsp_logits, tsp_grid, padding_mode='zeros', align_corners=True)
+            tsp_for_fuse = tsp_sampled.detach() if self.detach_sample else tsp_sampled
+            tsp_embed = self.tsp_sample_proj(tsp_for_fuse)
+            tsp_embed = tsp_embed * tsp_valid[:, None].to(tsp_embed.dtype)
+            if valid_mask is not None:
+                tsp_embed = tsp_embed * valid_mask[:, None].to(tsp_embed.dtype)
+            evidence_embed = evidence_embed + tsp_embed
         point_tokens = tokens + evidence_embed
         point_tokens = point_tokens.permute(0, 2, 3, 1).contiguous()
         residual = self.out_proj(self.out_norm(point_tokens))
@@ -243,6 +300,7 @@ class LaneEvidenceField(nn.Module):
             'bev': bev_logits,
             'tube': tube_sampled,
             'tube_valid': tube_valid,
+            'tsp': tsp_logits,
         }
         return tokens, logits, sampled
 
@@ -361,11 +419,82 @@ class LaneEvidenceField(nn.Module):
     def unpack_logits(logits):
         if isinstance(logits, dict):
             return (logits.get('image'), logits.get('bev'), logits.get('tube'),
-                    logits.get('tube_valid'))
-        return logits, None, None, None
+                    logits.get('tube_valid'), logits.get('tsp'))
+        return logits, None, None, None, None
+
+    def tsp_teacher_loss(self, tsp_logits, tsp_teacher, tsp_valid):
+        if tsp_teacher is None or tsp_valid is None:
+            if not self.allow_missing_tsp_teacher:
+                raise RuntimeError(
+                    'TSP-LDT is enabled but tsp_teacher/tsp_valid is missing. '
+                    'Check dataset pipeline and Collect keys.')
+            zero = tsp_logits.sum() * 0.
+            metrics = {
+                'batch_tsp_valid': zero.detach(),
+                'batch_tsp_occ': zero.detach(),
+                'batch_tsp_pred_occ': tsp_logits[:, :1].sigmoid().mean().detach(),
+                'batch_tsp_sdf_err': zero.detach(),
+                'batch_tsp_z_err': zero.detach(),
+                'batch_tsp_quality_err': zero.detach(),
+            }
+            return zero, metrics
+        target = tsp_teacher.to(device=tsp_logits.device, dtype=tsp_logits.dtype)
+        if target.shape[-2:] != tsp_logits.shape[-2:]:
+            target = F.interpolate(target, size=tsp_logits.shape[-2:], mode='bilinear',
+                                   align_corners=False)
+        if target.shape[1] < self.tsp_channels:
+            pad = target.new_zeros(
+                target.shape[0], self.tsp_channels - target.shape[1],
+                target.shape[2], target.shape[3])
+            target = torch.cat([target, pad], dim=1)
+        target = target[:, :self.tsp_channels]
+        valid = tsp_valid.to(device=tsp_logits.device, dtype=tsp_logits.dtype)
+        if valid.ndim == 3:
+            valid = valid[:, None]
+        if valid.shape[-2:] != tsp_logits.shape[-2:]:
+            valid = F.interpolate(valid, size=tsp_logits.shape[-2:], mode='nearest')
+        valid = valid[:, :1]
+        denom = valid.sum().clamp_min(1.0)
+        occ_target = target[:, :1].clamp(0., 1.)
+        occ_weight = 1. + occ_target * (self.tsp_pos_weight - 1.)
+        occ_loss = F.binary_cross_entropy_with_logits(
+            tsp_logits[:, :1].float(), occ_target.float(), reduction='none')
+        occ_loss = (occ_loss * occ_weight.float() * valid.float()).sum() / denom
+        total = self.tsp_occ_weight * occ_loss
+        sdf_loss = tsp_logits.new_tensor(0.)
+        z_loss = tsp_logits.new_tensor(0.)
+        quality_loss = tsp_logits.new_tensor(0.)
+        if self.tsp_channels > 1:
+            sdf_pred = tsp_logits[:, 1:2].sigmoid()
+            sdf_loss = F.smooth_l1_loss(sdf_pred, target[:, 1:2].clamp(0., 1.),
+                                        reduction='none')
+            sdf_loss = (sdf_loss * valid).sum() / denom
+            total = total + self.tsp_sdf_weight * sdf_loss
+        if self.tsp_channels > 2:
+            z_mask = valid * (occ_target > 0.05).to(valid.dtype)
+            z_loss = F.smooth_l1_loss(tsp_logits[:, 2:3].tanh(),
+                                      target[:, 2:3].clamp(-1., 1.),
+                                      reduction='none')
+            z_loss = (z_loss * z_mask).sum() / z_mask.sum().clamp_min(1.0)
+            total = total + self.tsp_z_weight * z_loss
+        if self.tsp_channels > 3:
+            quality_loss = F.smooth_l1_loss(tsp_logits[:, 3:4].sigmoid(),
+                                            target[:, 3:4].clamp(0., 1.),
+                                            reduction='none')
+            quality_loss = (quality_loss * valid).sum() / denom
+            total = total + self.tsp_quality_weight * quality_loss
+        metrics = {
+            'batch_tsp_valid': valid.sum().detach() / max(float(tsp_logits.shape[0]), 1.0),
+            'batch_tsp_occ': occ_target.mean().detach(),
+            'batch_tsp_pred_occ': tsp_logits[:, :1].sigmoid().mean().detach(),
+            'batch_tsp_sdf_err': sdf_loss.detach(),
+            'batch_tsp_z_err': z_loss.detach(),
+            'batch_tsp_quality_err': quality_loss.detach(),
+        }
+        return total, metrics
 
     def loss(self, logits_all, gt_3dlanes, gt_project_matrix, project_builder,
-             y_max):
+             y_max, tsp_teacher=None, tsp_valid=None):
         total_loss = None
         total_bev_loss = None
         total_pos = 0.
@@ -375,13 +504,16 @@ class LaneEvidenceField(nn.Module):
         total_tube_valid = 0.
         total_tube_center_prob = 0.
         total_tube_max_prob = 0.
+        total_tsp_loss = None
+        tsp_metric_sums = {}
         count = 0
         bev_count = 0
         tube_count = 0
+        tsp_count = 0
         metric_batch_size = None
         for iter_logits in logits_all:
             for logits in iter_logits:
-                evidence_logits, bev_logits, tube_logits, tube_valid = (
+                evidence_logits, bev_logits, tube_logits, tube_valid, tsp_logits = (
                     self.unpack_logits(logits))
                 if (evidence_logits is None or gt_project_matrix is None or
                         project_builder is None):
@@ -428,7 +560,16 @@ class LaneEvidenceField(nn.Module):
                         point_valid.sum().clamp_min(1.)).detach()
                     metric_batch_size = tube_logits.shape[0]
                     tube_count += 1
-        if count == 0 and bev_count == 0:
+                if tsp_logits is not None:
+                    tsp_loss, tsp_metrics = self.tsp_teacher_loss(
+                        tsp_logits, tsp_teacher, tsp_valid)
+                    total_tsp_loss = (tsp_loss if total_tsp_loss is None
+                                      else total_tsp_loss + tsp_loss)
+                    for key, value in tsp_metrics.items():
+                        tsp_metric_sums[key] = tsp_metric_sums.get(key, 0) + value
+                    metric_batch_size = tsp_logits.shape[0]
+                    tsp_count += 1
+        if count == 0 and bev_count == 0 and tsp_count == 0:
             return {}, {}
         if gt_3dlanes is None:
             batch_size = int(metric_batch_size or 1)
@@ -452,4 +593,8 @@ class LaneEvidenceField(nn.Module):
             metrics['batch_tube_valid'] = total_tube_valid / tube_count
             metrics['batch_tube_center_prob'] = total_tube_center_prob / tube_count
             metrics['batch_tube_max_prob'] = total_tube_max_prob / tube_count
+        if tsp_count > 0:
+            losses['tsp_ldt_loss'] = total_tsp_loss * self.tsp_loss_weight / tsp_count
+            for key, value in tsp_metric_sums.items():
+                metrics[key] = value / tsp_count
         return losses, metrics

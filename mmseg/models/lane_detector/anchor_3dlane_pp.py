@@ -804,7 +804,8 @@ class Anchor3DLanePP(BaseModule):
             return self.forward_test(img, mask, img_metas, **kwargs)
     
     @force_fp32()
-    def loss(self, output, gt_3dlanes, gt_project_matrix=None):
+    def loss(self, output, gt_3dlanes, gt_project_matrix=None,
+             tsp_teacher=None, tsp_valid=None):
         losses = dict()
         metric_sums = {}
         metric_counts = {}
@@ -853,7 +854,8 @@ class Anchor3DLanePP(BaseModule):
         if self.lane_evidence_field_enabled:
             evidence_losses, evidence_metrics = self.lane_evidence_field.loss(
                 output.get('lane_evidence_logits'), gt_3dlanes, gt_project_matrix,
-                self.obtain_projection_matrix, float(self.y_steps[-1]))
+                self.obtain_projection_matrix, float(self.y_steps[-1]),
+                tsp_teacher=tsp_teacher, tsp_valid=tsp_valid)
             losses.update(evidence_losses)
             other_vars.update(evidence_metrics)
         return losses, other_vars
@@ -862,7 +864,10 @@ class Anchor3DLanePP(BaseModule):
     def forward_train(self, img, mask, img_metas, gt_3dlanes=None, gt_project_matrix=None, **kwargs): 
         gt_project_matrix = gt_project_matrix.squeeze(1)
         output = self.encoder_decoder(img, mask, gt_project_matrix, **kwargs)
-        losses, other_vars = self.loss(output, gt_3dlanes, gt_project_matrix)
+        losses, other_vars = self.loss(
+            output, gt_3dlanes, gt_project_matrix,
+            tsp_teacher=kwargs.get('tsp_teacher'),
+            tsp_valid=kwargs.get('tsp_valid'))
         return losses, other_vars
 
     def train_step(self, data_batch, optimizer=None, **kwargs):

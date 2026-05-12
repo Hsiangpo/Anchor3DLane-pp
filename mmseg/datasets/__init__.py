@@ -21,6 +21,7 @@ except ModuleNotFoundError:
 from .lane_datasets.openlane import OpenlaneDataset
 from .lane_datasets.openlane_lidar import OpenlaneLidarDataset
 from .lane_datasets.openlane_temporal import OpenlaneMFDataset
+from .lane_datasets.openlane_tsp_ldt import OpenlaneTSPDataset
 from .loveda import LoveDADataset
 from .night_driving import NightDrivingDataset
 from .pascal_context import PascalContextDataset, PascalContextDataset59
@@ -36,4 +37,5 @@ __all__ = [
     'STAREDataset', 'DarkZurichDataset', 'NightDrivingDataset',
     'COCOStuffDataset', 'LoveDADataset', 'MultiImageMixDataset',
     'iSAIDDataset', 'ISPRSDataset', 'PotsdamDataset', 'APOLLOSIMDataset', 'OpenlaneDataset',
-    'OpenlaneMFDataset', 'ONCEDataset', 'OpenlaneLidarDataset']
+    'OpenlaneMFDataset', 'ONCEDataset', 'OpenlaneLidarDataset',
+    'OpenlaneTSPDataset']

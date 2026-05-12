@@ -1,4 +1,4 @@
-[系统状态]：Anchor3DLane-pp is deployed and the official checkpoint baseline is reproduced on OpenLane validation, current stable F1 = 62.574; latest successful experiment is `lof_oc`; latest failed experiment is `brf_lpf`; current running experiment is none; ApolloSim is not mounted yet.
+[系统状态]：Anchor3DLane-pp is deployed and the official checkpoint baseline is reproduced on OpenLane validation, current stable F1 = 62.580; latest successful experiment is `lef_dff`; latest failed experiment is `brf_lpf`; current running experiment is none; ApolloSim is not mounted yet.
 
 # Anchor3DLane-pp Agent Notes
 
@@ -35,12 +35,25 @@
   - Result file: `/root/autodl-tmp/Anchor3DLane-pp/output/openlane/baseline_eval/evaluation_result.json`
   - Metrics: F1 `0.6240448139487519`, recall `0.613268850798542`, precision `0.6352062468171787`, category accuracy `0.9337897428296154`.
 - Current stable score:
-  - Experiment: `strip_sample + vdcc + eac_dr + frt_eat + lpf_t + lof_oc` / Lane Ownership Field with Ownership Contrast.
-  - Result file: `/root/autodl-tmp/Anchor3DLane-pp/output/openlane/experiments/lof_oc_r50x2_eval/evaluation_result.json`.
-  - Metrics: F1 `0.6257406098709484`, recall `0.6168139636073128`, precision `0.6349294264784706`, category accuracy `0.9351244296780283`.
-  - Improvement over previous stable `strip_sample + vdcc + eac_dr + frt_eat + lpf_t`: `+0.0000628723468071` F1, or `+0.006287` points on the 0-100 reporting scale.
-  - Improvement over official checkpoint baseline: `+0.0016957959221965` F1, or `+0.169580` points on the 0-100 reporting scale.
+  - Experiment: `strip_sample + vdcc + eac_dr + frt_eat + lpf_t + lof_oc + lef_dff` / Dense Lane Evidence Field Gated Fusion.
+  - Result file: `/root/autodl-tmp/Anchor3DLane-pp/output/openlane/experiments/lef_dff_r50x2_eval/evaluation_result.json`.
+  - Metrics: F1 `0.625799625360854`, recall `0.6161577254213834`, precision `0.6357480836143437`, category accuracy `0.9351688869948677`.
+  - Improvement over previous stable `strip_sample + vdcc + eac_dr + frt_eat + lpf_t + lof_oc`: `+0.0000590154899056` F1, or `+0.005902` points on the 0-100 reporting scale.
+  - Improvement over official checkpoint baseline: `+0.0017548114121021` F1, or `+0.175481` points on the 0-100 reporting scale.
 - Latest successful score-improvement experiment:
+  - Selected idea: LEF-DFF / Dense Lane Evidence Field Gated Fusion.
+  - Rationale: LOF-OC recovered recall through ownership supervision but still only produced a tiny gain. LEF-DFF adds dense 2D lane-evidence supervision from projected OpenLane 3D GT and samples that evidence at the existing 30 proposal lanes. It keeps the 30-proposal path, matcher, NMS, thresholds, LPF-T, LOF-OC, and accept calibration behavior unchanged.
+  - Code: `mmseg/models/lane_detector/field/lane_evidence_field.py` adds `LaneEvidenceField`; `mmseg/models/lane_detector/anchor_3dlane_pp.py` adds optional final-only `lane_evidence_field` and model-level `lane_evidence_loss`; config is `configs_v2/openlane/experiments/anchor3dlane++_r50x2_lef_dff.py`.
+  - Checkpoint source: `output/openlane/experiments/lof_oc_r50x2/iter_10000.pth`.
+  - Validation before formal training: local and remote `py_compile` and `git diff --check` passed; code review subagent PASS; remote config/model/checkpoint load passed with missing keys only `lane_evidence_field.*`, `unexpected=[]`, trainable prefixes only `accept_calib_head` and `lane_evidence_field`; real-sample target sanity produced nonzero dense target; remote 2-GPU DDP 1-iter and 20-iter smoke passed with memory about `18976MB`, finite `lane_evidence_loss`, nonzero `batch_lane_evidence_pos`, and no OOM/NaN/Traceback/Killed/DDP hard error.
+  - Formal training and validation completed:
+    - Training log: `logs/train_lef_dff_20260512_120823.log`.
+    - Final checkpoint: `output/openlane/experiments/lef_dff_r50x2/iter_10000.pth`.
+    - Evaluation log: `logs/eval_lef_dff_20260512_124029.log`.
+    - Result file: `output/openlane/experiments/lef_dff_r50x2_eval/evaluation_result.json`.
+    - Metrics: F1 `0.625799625360854`, recall `0.6161577254213834`, precision `0.6357480836143437`, category accuracy `0.9351688869948677`.
+  - Decision: LEF-DFF improves over previous stable LOF-OC F1 `0.6257406098709484` and official baseline F1 `0.6240448139487519`; keep the implementation, record it in `docs/实验记录.md`, and commit/push this stable version. The minimum target F1 > 65 is still not reached.
+- Previous successful score-improvement experiment:
   - Selected idea: LOF-OC / Lane Ownership Field with Ownership Contrast.
   - Rationale: LPF-T raised precision but reduced recall, and BRF-LPF showed same-slot score floors are too weak. LOF-OC keeps the 30-proposal inference path, matcher, NMS, and thresholds unchanged, then models lane-slot ownership relations at the final `[B, C=128, N=30, L=20]` token field. It uses evaluator-clean and FRT-clean ownership labels so clean duplicate candidates can support a lane-level MIL objective without turning near-GT ambiguous proposals into geometry positives.
   - Code: `mmseg/models/lane_detector/field/lane_ownership_field.py` adds `LaneOwnershipField`; `mmseg/models/lane_detector/anchor_3dlane_pp.py` adds optional final-only `ownership_field`; `mmseg/models/losses/lane_loss_v2.py` adds `ownership_contrast_losses`, `ownership_mil_losses`, owner-clean negative removal, and `batch_owner_*` logging; config is `configs_v2/openlane/experiments/anchor3dlane++_r50x2_lof_oc.py`.

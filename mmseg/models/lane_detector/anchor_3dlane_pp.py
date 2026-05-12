@@ -20,7 +20,7 @@ import torch.nn.functional as F
 from mmcv.runner import BaseModule, auto_fp16, force_fp32
 
 from ..builder import LANENET2S, build_backbone, build_loss, build_neck
-from .field import LaneOwnershipField, LanePointFieldTransformer
+from .field import LaneEvidenceField, LaneOwnershipField, LanePointFieldTransformer
 from .tools import homography_crop_resize
 from .utils import AnchorGenerator_torch, DecodeLayer, nms_3d
 
@@ -80,6 +80,7 @@ class Anchor3DLanePP(BaseModule):
                  accept_calib=None,
                  lane_point_field=None,
                  ownership_field=None,
+                 lane_evidence_field=None,
                  loss_lane = None,
                  loss_aux = None,
                  init_cfg = None,
@@ -192,6 +193,7 @@ class Anchor3DLanePP(BaseModule):
                                           self.anchor_num * self.yaw_num, self.anchor_num * self.pitch_num, self.anchor_num)
         self.build_lane_point_field(lane_point_field)
         self.build_ownership_field(ownership_field)
+        self.build_lane_evidence_field(lane_evidence_field)
         self.build_accept_calib(accept_calib)
         for i in range(self.iter_reg):
             nn.init.zeros_(self.reg_prior_layer[i].layer[-1].weight.data)
@@ -268,6 +270,37 @@ class Anchor3DLanePP(BaseModule):
             use_geometry=use_geometry,
             detach_geometry=detach_geometry)
 
+    def build_lane_evidence_field(self, lane_evidence_field):
+        self.lane_evidence_field = None
+        self.lane_evidence_field_enabled = False
+        self.lane_evidence_field_apply = 'final'
+        self.lane_evidence_field_trainable = False
+        if lane_evidence_field is None:
+            return
+        cfg = lane_evidence_field.copy()
+        if not cfg.pop('enabled', True):
+            return
+        self.lane_evidence_field_enabled = True
+        self.lane_evidence_field_trainable = bool(cfg.pop('trainable', True))
+        self.lane_evidence_field_apply = cfg.pop('apply', 'final')
+        hidden_channels = int(cfg.pop('hidden_channels', self.anchor_feat_channels))
+        gate_init = float(cfg.pop('gate_init', -2.1972246))
+        detach_sample = bool(cfg.pop('detach_sample', True))
+        loss_weight = float(cfg.pop('loss_weight', 0.02))
+        pos_weight = float(cfg.pop('pos_weight', 10.0))
+        target_radius = int(cfg.pop('target_radius', 1))
+        if cfg:
+            raise ValueError(f'Unsupported lane_evidence_field options: {sorted(cfg.keys())}')
+        self.lane_evidence_field = LaneEvidenceField(
+            self.anchor_feat_channels,
+            self.proj_channel,
+            hidden_channels=hidden_channels,
+            gate_init=gate_init,
+            detach_sample=detach_sample,
+            loss_weight=loss_weight,
+            pos_weight=pos_weight,
+            target_radius=target_radius)
+
     def build_accept_calib(self, accept_calib):
         self.accept_calib = False
         self.accept_calib_freeze_base = False
@@ -299,6 +332,9 @@ class Anchor3DLanePP(BaseModule):
             prefixes.append('lane_point_field.')
         if getattr(self, 'ownership_field_enabled', False) and self.ownership_field_trainable:
             prefixes.append('ownership_field.')
+        if (getattr(self, 'lane_evidence_field_enabled', False) and
+                self.lane_evidence_field_trainable):
+            prefixes.append('lane_evidence_field.')
         return tuple(prefixes)
 
     def freeze_base_for_accept_calib(self):
@@ -316,6 +352,9 @@ class Anchor3DLanePP(BaseModule):
             if (getattr(self, 'ownership_field_enabled', False) and
                     self.ownership_field_trainable):
                 trainable_children.add('ownership_field')
+            if (getattr(self, 'lane_evidence_field_enabled', False) and
+                    self.lane_evidence_field_trainable):
+                trainable_children.add('lane_evidence_field')
             for name, module in self.named_children():
                 if name not in trainable_children:
                     module.eval()
@@ -326,6 +365,9 @@ class Anchor3DLanePP(BaseModule):
             if (getattr(self, 'ownership_field_enabled', False) and
                     self.ownership_field_trainable):
                 self.ownership_field.train(True)
+            if (getattr(self, 'lane_evidence_field_enabled', False) and
+                    self.lane_evidence_field_trainable):
+                self.lane_evidence_field.train(True)
         return self
 
     def use_accept_calib(self, feat_idx, iter_idx):
@@ -354,6 +396,16 @@ class Anchor3DLanePP(BaseModule):
         if self.ownership_field_apply == 'all':
             return True
         raise ValueError(f'Unsupported ownership_field_apply: {self.ownership_field_apply}')
+
+    def use_lane_evidence_field(self, feat_idx, iter_idx):
+        if not getattr(self, 'lane_evidence_field_enabled', False):
+            return False
+        if self.lane_evidence_field_apply == 'final':
+            return feat_idx == self.feat_num - 1 and iter_idx == self.iter_reg - 1
+        if self.lane_evidence_field_apply == 'all':
+            return True
+        raise ValueError(
+            f'Unsupported lane_evidence_field_apply: {self.lane_evidence_field_apply}')
 
     def load_pretrained(self, ckpt, strict=True):
         pth = torch.load(ckpt, map_location='cpu')
@@ -431,7 +483,8 @@ class Anchor3DLanePP(BaseModule):
         strip_weights = self.strip_weight_logits.softmax(0).to(strip_features.dtype)
         return (strip_features * strip_weights.view(1, 1, 1, 1, num_offsets)).sum(-1)
 
-    def cut_anchor_features(self, features, h_g2feats, xs, ys, zs, anchor_feat_len, feat_size, use_strip):
+    def cut_anchor_features(self, features, h_g2feats, xs, ys, zs, anchor_feat_len,
+                            feat_size, use_strip, return_grid=False):
         # definitions
         batch_size = features.shape[0]
 
@@ -453,7 +506,10 @@ class Anchor3DLanePP(BaseModule):
 
         valid_mask = (batch_us > -1) & (batch_us < 1) & (batch_vs > -1) & (batch_vs < 1)
 
-        return batch_anchor_features, valid_mask.reshape(batch_size, -1, anchor_feat_len)
+        valid_mask = valid_mask.reshape(batch_size, -1, anchor_feat_len)
+        if return_grid:
+            return batch_anchor_features, valid_mask, batch_us, batch_vs
+        return batch_anchor_features, valid_mask
 
     def feature_extractor(self, img, mask):
         output = self.backbone(img)
@@ -474,6 +530,7 @@ class Anchor3DLanePP(BaseModule):
         anchors_all = []
         accept_logits_all = []
         ownership_logits_all = []
+        lane_evidence_logits_all = []
 
         for iter_idx in range(self.iter_reg):
             
@@ -481,6 +538,7 @@ class Anchor3DLanePP(BaseModule):
             anchors_layer = []
             accept_logits_layer = []
             ownership_logits_layer = []
+            lane_evidence_logits_layer = []
             
             for feat_idx, feat_size in enumerate(self.feat_sizes[::-1]):
                 # [4, 3, 2]
@@ -500,42 +558,47 @@ class Anchor3DLanePP(BaseModule):
                         xs = x_weights @ init_xs
                         xs = xs.squeeze(-1)
                         anchors = self.anchor_generator.generate_anchors_batch(xs, yaws, pitches)
-                        reg_proposals, update_anchors, accept_logits, ownership_logits = self.get_proposals(
+                        reg_proposals, update_anchors, accept_logits, ownership_logits, evidence_logits = self.get_proposals(
                             project_matrixes, anchor_feats[select_idx], feat_idx, anchors, feat_size, iter_idx, True)
                         reg_proposals_layer.append(reg_proposals)
                         anchors_layer.append(update_anchors)
                         accept_logits_layer.append(accept_logits)
                         ownership_logits_layer.append(ownership_logits)
+                        lane_evidence_logits_layer.append(evidence_logits)
                     else:
                         proposals_prev = reg_proposals_layer[feat_idx - 1]
-                        reg_proposals, _, accept_logits, ownership_logits = self.get_proposals(
+                        reg_proposals, _, accept_logits, ownership_logits, evidence_logits = self.get_proposals(
                             project_matrixes, anchor_feats[select_idx], feat_idx, proposals_prev, feat_size, iter_idx, False)
                         reg_proposals_layer.append(reg_proposals)
                         anchors_layer.append(proposals_prev[:, :, :5+self.anchor_len*3])
                         accept_logits_layer.append(accept_logits)
                         ownership_logits_layer.append(ownership_logits)
+                        lane_evidence_logits_layer.append(evidence_logits)
                 else:
                     if feat_idx == 0:
                         proposals_prev = reg_proposals_all[iter_idx - 1][0]
-                        reg_proposals, update_anchors, accept_logits, ownership_logits = self.get_proposals(
+                        reg_proposals, update_anchors, accept_logits, ownership_logits, evidence_logits = self.get_proposals(
                             project_matrixes, anchor_feats[select_idx], feat_idx, proposals_prev, feat_size, iter_idx, True)
                         reg_proposals_layer.append(reg_proposals)
                         anchors_layer.append(update_anchors)
                         accept_logits_layer.append(accept_logits)
                         ownership_logits_layer.append(ownership_logits)
+                        lane_evidence_logits_layer.append(evidence_logits)
                     else:
                         proposals_prev = reg_proposals_layer[feat_idx - 1]
-                        reg_proposals, _, accept_logits, ownership_logits = self.get_proposals(
+                        reg_proposals, _, accept_logits, ownership_logits, evidence_logits = self.get_proposals(
                             project_matrixes, anchor_feats[select_idx], feat_idx, proposals_prev, feat_size, iter_idx, False)
                         reg_proposals_layer.append(reg_proposals)
                         anchors_layer.append(proposals_prev[:, :, :5+self.anchor_len*3])
                         accept_logits_layer.append(accept_logits)
                         ownership_logits_layer.append(ownership_logits)
+                        lane_evidence_logits_layer.append(evidence_logits)
             
             reg_proposals_all.append(reg_proposals_layer)
             anchors_all.append(anchors_layer)
             accept_logits_all.append(accept_logits_layer)
             ownership_logits_all.append(ownership_logits_layer)
+            lane_evidence_logits_all.append(lane_evidence_logits_layer)
 
                     
         output = {'reg_proposals':reg_proposals_all, 'anchors':anchors_all}
@@ -543,6 +606,8 @@ class Anchor3DLanePP(BaseModule):
             output['accept_logits'] = accept_logits_all
         if self.ownership_field_enabled:
             output['ownership_logits'] = ownership_logits_all
+        if self.lane_evidence_field_enabled:
+            output['lane_evidence_logits'] = lane_evidence_logits_all
         return output
         
 
@@ -617,8 +682,14 @@ class Anchor3DLanePP(BaseModule):
         batch_size = project_matrixes.shape[0]
         xs, ys, zs = self.compute_anchor_cut_indices(proposals_prev, self.feat_y_steps)
         use_strip = self.use_strip_sample(feat_idx, iter_idx)
-        batch_anchor_features, valid_mask = self.cut_anchor_features(
-            anchor_feat, project_matrixes, xs, ys, zs, self.anchor_feat_len, feat_size, use_strip)   # [B, C, N, l]
+        use_evidence = self.use_lane_evidence_field(feat_idx, iter_idx)
+        cut_result = self.cut_anchor_features(
+            anchor_feat, project_matrixes, xs, ys, zs, self.anchor_feat_len,
+            feat_size, use_strip, return_grid=use_evidence)
+        if use_evidence:
+            batch_anchor_features, valid_mask, batch_us, batch_vs = cut_result
+        else:
+            batch_anchor_features, valid_mask = cut_result
 
         batch_geometry = None
         if self.with_pos != 'none':
@@ -654,6 +725,15 @@ class Anchor3DLanePP(BaseModule):
                     f'got {batch_anchor_features.shape[1]} at layer {feat_idx}/{iter_idx}')
             batch_anchor_features, ownership_logits = self.ownership_field(
                 batch_anchor_features, valid_mask=valid_mask, geometry=batch_geometry)
+        evidence_logits = None
+        if use_evidence:
+            if batch_anchor_features.shape[1] != self.proj_channel:
+                raise ValueError(
+                    f'LaneEvidenceField expected {self.proj_channel} token channels, '
+                    f'got {batch_anchor_features.shape[1]} at layer {feat_idx}/{iter_idx}')
+            batch_anchor_features, evidence_logits, _ = self.lane_evidence_field(
+                batch_anchor_features, anchor_feat, batch_us, batch_vs,
+                valid_mask=valid_mask)
 
         batch_anchor_features = batch_anchor_features.transpose(1, 2)  # [B, N, C, l]
         batch_anchor_features = batch_anchor_features.flatten(2, 3)  # [B, N, C*l]
@@ -699,9 +779,9 @@ class Anchor3DLanePP(BaseModule):
         reg_proposals[:, :, 5+self.anchor_len*3:5+self.anchor_len*3+self.num_category] = cls_logits   # [B, N, C]
 
         if reg_prior:
-            return reg_proposals, cur_anchors, accept_logits, ownership_logits
+            return reg_proposals, cur_anchors, accept_logits, ownership_logits, evidence_logits
         else:
-            return reg_proposals, None, accept_logits, ownership_logits
+            return reg_proposals, None, accept_logits, ownership_logits, evidence_logits
 
 
 
@@ -734,9 +814,8 @@ class Anchor3DLanePP(BaseModule):
         else:
             return self.forward_test(img, mask, img_metas, **kwargs)
     
-
     @force_fp32()
-    def loss(self, output, gt_3dlanes):
+    def loss(self, output, gt_3dlanes, gt_project_matrix=None):
         losses = dict()
         metric_sums = {}
         metric_counts = {}
@@ -782,28 +861,19 @@ class Anchor3DLanePP(BaseModule):
         other_vars['batch_negatives'] = anchor_losses['batch_negatives']
         for k, v in metric_sums.items():
             other_vars[k] = v / metric_counts[k]
+        if self.lane_evidence_field_enabled:
+            evidence_losses, evidence_metrics = self.lane_evidence_field.loss(
+                output.get('lane_evidence_logits'), gt_3dlanes, gt_project_matrix,
+                self.obtain_projection_matrix, float(self.y_steps[-1]))
+            losses.update(evidence_losses)
+            other_vars.update(evidence_metrics)
         return losses, other_vars
 
     @auto_fp16(apply_to=('img', 'mask', ))
     def forward_train(self, img, mask, img_metas, gt_3dlanes=None, gt_project_matrix=None, **kwargs): 
-        """Forward function for training.
-
-        Args:
-            img (Tensor): Input images.
-            img_metas (list[dict]): List of image info dict where each dict
-                has: 'img_shape', 'scale_factor', 'flip', and may also contain
-                'filename', 'ori_shape', 'pad_shape', and 'img_norm_cfg'.
-                For details on the values of these keys see
-                `mmseg/datasets/pipelines/formatting.py:Collect`.
-            gt_semantic_seg (Tensor): Semantic segmentation masks
-                used if the architecture supports semantic segmentation task.
-
-        Returns:
-            dict[str, Tensor]: a dictionary of loss components
-        """
         gt_project_matrix = gt_project_matrix.squeeze(1)
         output = self.encoder_decoder(img, mask, gt_project_matrix, **kwargs)
-        losses, other_vars = self.loss(output, gt_3dlanes)
+        losses, other_vars = self.loss(output, gt_3dlanes, gt_project_matrix)
         return losses, other_vars
 
     def train_step(self, data_batch, optimizer=None, **kwargs):

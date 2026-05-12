@@ -20,7 +20,7 @@ import torch.nn.functional as F
 from mmcv.runner import BaseModule, auto_fp16, force_fp32
 
 from ..builder import LANENET2S, build_backbone, build_loss, build_neck
-from .field import LanePointFieldTransformer
+from .field import LaneOwnershipField, LanePointFieldTransformer
 from .tools import homography_crop_resize
 from .utils import AnchorGenerator_torch, DecodeLayer, nms_3d
 
@@ -79,6 +79,7 @@ class Anchor3DLanePP(BaseModule):
                  strip_apply='all',
                  accept_calib=None,
                  lane_point_field=None,
+                 ownership_field=None,
                  loss_lane = None,
                  loss_aux = None,
                  init_cfg = None,
@@ -190,6 +191,7 @@ class Anchor3DLanePP(BaseModule):
         self.expert_layer = ExpertDecode(self.anchor_feat_channels * self.feat_sizes[-1][1], self.anchor_num * self.x_num, \
                                           self.anchor_num * self.yaw_num, self.anchor_num * self.pitch_num, self.anchor_num)
         self.build_lane_point_field(lane_point_field)
+        self.build_ownership_field(ownership_field)
         self.build_accept_calib(accept_calib)
         for i in range(self.iter_reg):
             nn.init.zeros_(self.reg_prior_layer[i].layer[-1].weight.data)
@@ -212,12 +214,14 @@ class Anchor3DLanePP(BaseModule):
         self.lane_point_field = None
         self.lane_point_field_enabled = False
         self.lane_point_field_apply = 'final'
+        self.lane_point_field_trainable = False
         if lane_point_field is None:
             return
         cfg = lane_point_field.copy()
         if not cfg.pop('enabled', True):
             return
         self.lane_point_field_enabled = True
+        self.lane_point_field_trainable = bool(cfg.pop('trainable', True))
         self.lane_point_field_apply = cfg.pop('apply', 'final')
         num_heads = int(cfg.pop('num_heads', 4))
         ffn_ratio = float(cfg.pop('ffn_ratio', 2.0))
@@ -232,6 +236,34 @@ class Anchor3DLanePP(BaseModule):
             num_heads=num_heads,
             ffn_ratio=ffn_ratio,
             dropout=dropout,
+            gate_init=gate_init,
+            use_geometry=use_geometry,
+            detach_geometry=detach_geometry)
+
+    def build_ownership_field(self, ownership_field):
+        self.ownership_field = None
+        self.ownership_field_enabled = False
+        self.ownership_field_apply = 'final'
+        self.ownership_field_trainable = False
+        if ownership_field is None:
+            return
+        cfg = ownership_field.copy()
+        if not cfg.pop('enabled', True):
+            return
+        self.ownership_field_enabled = True
+        self.ownership_field_trainable = bool(cfg.pop('trainable', True))
+        self.ownership_field_apply = cfg.pop('apply', 'final')
+        hidden_channels = cfg.pop('hidden_channels', None)
+        relation_hidden = int(cfg.pop('relation_hidden', 64))
+        gate_init = float(cfg.pop('gate_init', -2.1972246))
+        use_geometry = bool(cfg.pop('use_geometry', True))
+        detach_geometry = bool(cfg.pop('detach_geometry', True))
+        if cfg:
+            raise ValueError(f'Unsupported ownership_field options: {sorted(cfg.keys())}')
+        self.ownership_field = LaneOwnershipField(
+            self.proj_channel,
+            hidden_channels=hidden_channels,
+            relation_hidden=relation_hidden,
             gate_init=gate_init,
             use_geometry=use_geometry,
             detach_geometry=detach_geometry)
@@ -263,8 +295,10 @@ class Anchor3DLanePP(BaseModule):
 
     def frozen_base_trainable_prefixes(self):
         prefixes = ['accept_calib_head.']
-        if getattr(self, 'lane_point_field_enabled', False):
+        if getattr(self, 'lane_point_field_enabled', False) and self.lane_point_field_trainable:
             prefixes.append('lane_point_field.')
+        if getattr(self, 'ownership_field_enabled', False) and self.ownership_field_trainable:
+            prefixes.append('ownership_field.')
         return tuple(prefixes)
 
     def freeze_base_for_accept_calib(self):
@@ -276,14 +310,22 @@ class Anchor3DLanePP(BaseModule):
         super(Anchor3DLanePP, self).train(mode)
         if mode and getattr(self, 'accept_calib_freeze_base', False):
             trainable_children = {'accept_calib_head'}
-            if getattr(self, 'lane_point_field_enabled', False):
+            if (getattr(self, 'lane_point_field_enabled', False) and
+                    self.lane_point_field_trainable):
                 trainable_children.add('lane_point_field')
+            if (getattr(self, 'ownership_field_enabled', False) and
+                    self.ownership_field_trainable):
+                trainable_children.add('ownership_field')
             for name, module in self.named_children():
                 if name not in trainable_children:
                     module.eval()
             self.accept_calib_head.train(True)
-            if getattr(self, 'lane_point_field_enabled', False):
+            if (getattr(self, 'lane_point_field_enabled', False) and
+                    self.lane_point_field_trainable):
                 self.lane_point_field.train(True)
+            if (getattr(self, 'ownership_field_enabled', False) and
+                    self.ownership_field_trainable):
+                self.ownership_field.train(True)
         return self
 
     def use_accept_calib(self, feat_idx, iter_idx):
@@ -303,6 +345,15 @@ class Anchor3DLanePP(BaseModule):
         if self.lane_point_field_apply == 'all':
             return True
         raise ValueError(f'Unsupported lane_point_field_apply: {self.lane_point_field_apply}')
+
+    def use_ownership_field(self, feat_idx, iter_idx):
+        if not getattr(self, 'ownership_field_enabled', False):
+            return False
+        if self.ownership_field_apply == 'final':
+            return feat_idx == self.feat_num - 1 and iter_idx == self.iter_reg - 1
+        if self.ownership_field_apply == 'all':
+            return True
+        raise ValueError(f'Unsupported ownership_field_apply: {self.ownership_field_apply}')
 
     def load_pretrained(self, ckpt, strict=True):
         pth = torch.load(ckpt, map_location='cpu')
@@ -422,12 +473,14 @@ class Anchor3DLanePP(BaseModule):
         reg_proposals_all = []
         anchors_all = []
         accept_logits_all = []
+        ownership_logits_all = []
 
         for iter_idx in range(self.iter_reg):
             
             reg_proposals_layer = []
             anchors_layer = []
             accept_logits_layer = []
+            ownership_logits_layer = []
             
             for feat_idx, feat_size in enumerate(self.feat_sizes[::-1]):
                 # [4, 3, 2]
@@ -447,42 +500,49 @@ class Anchor3DLanePP(BaseModule):
                         xs = x_weights @ init_xs
                         xs = xs.squeeze(-1)
                         anchors = self.anchor_generator.generate_anchors_batch(xs, yaws, pitches)
-                        reg_proposals, update_anchors, accept_logits = self.get_proposals(
+                        reg_proposals, update_anchors, accept_logits, ownership_logits = self.get_proposals(
                             project_matrixes, anchor_feats[select_idx], feat_idx, anchors, feat_size, iter_idx, True)
                         reg_proposals_layer.append(reg_proposals)
                         anchors_layer.append(update_anchors)
                         accept_logits_layer.append(accept_logits)
+                        ownership_logits_layer.append(ownership_logits)
                     else:
                         proposals_prev = reg_proposals_layer[feat_idx - 1]
-                        reg_proposals, _, accept_logits = self.get_proposals(
+                        reg_proposals, _, accept_logits, ownership_logits = self.get_proposals(
                             project_matrixes, anchor_feats[select_idx], feat_idx, proposals_prev, feat_size, iter_idx, False)
                         reg_proposals_layer.append(reg_proposals)
                         anchors_layer.append(proposals_prev[:, :, :5+self.anchor_len*3])
                         accept_logits_layer.append(accept_logits)
+                        ownership_logits_layer.append(ownership_logits)
                 else:
                     if feat_idx == 0:
                         proposals_prev = reg_proposals_all[iter_idx - 1][0]
-                        reg_proposals, update_anchors, accept_logits = self.get_proposals(
+                        reg_proposals, update_anchors, accept_logits, ownership_logits = self.get_proposals(
                             project_matrixes, anchor_feats[select_idx], feat_idx, proposals_prev, feat_size, iter_idx, True)
                         reg_proposals_layer.append(reg_proposals)
                         anchors_layer.append(update_anchors)
                         accept_logits_layer.append(accept_logits)
+                        ownership_logits_layer.append(ownership_logits)
                     else:
                         proposals_prev = reg_proposals_layer[feat_idx - 1]
-                        reg_proposals, _, accept_logits = self.get_proposals(
+                        reg_proposals, _, accept_logits, ownership_logits = self.get_proposals(
                             project_matrixes, anchor_feats[select_idx], feat_idx, proposals_prev, feat_size, iter_idx, False)
                         reg_proposals_layer.append(reg_proposals)
                         anchors_layer.append(proposals_prev[:, :, :5+self.anchor_len*3])
                         accept_logits_layer.append(accept_logits)
+                        ownership_logits_layer.append(ownership_logits)
             
             reg_proposals_all.append(reg_proposals_layer)
             anchors_all.append(anchors_layer)
             accept_logits_all.append(accept_logits_layer)
+            ownership_logits_all.append(ownership_logits_layer)
 
                     
         output = {'reg_proposals':reg_proposals_all, 'anchors':anchors_all}
         if self.accept_calib:
             output['accept_logits'] = accept_logits_all
+        if self.ownership_field_enabled:
+            output['ownership_logits'] = ownership_logits_all
         return output
         
 
@@ -586,6 +646,14 @@ class Anchor3DLanePP(BaseModule):
                     f'got {batch_anchor_features.shape[1]} at layer {feat_idx}/{iter_idx}')
             batch_anchor_features = self.lane_point_field(
                 batch_anchor_features, valid_mask=valid_mask, geometry=batch_geometry)
+        ownership_logits = None
+        if self.use_ownership_field(feat_idx, iter_idx):
+            if batch_anchor_features.shape[1] != self.proj_channel:
+                raise ValueError(
+                    f'LaneOwnershipField expected {self.proj_channel} channels, '
+                    f'got {batch_anchor_features.shape[1]} at layer {feat_idx}/{iter_idx}')
+            batch_anchor_features, ownership_logits = self.ownership_field(
+                batch_anchor_features, valid_mask=valid_mask, geometry=batch_geometry)
 
         batch_anchor_features = batch_anchor_features.transpose(1, 2)  # [B, N, C, l]
         batch_anchor_features = batch_anchor_features.flatten(2, 3)  # [B, N, C*l]
@@ -631,9 +699,9 @@ class Anchor3DLanePP(BaseModule):
         reg_proposals[:, :, 5+self.anchor_len*3:5+self.anchor_len*3+self.num_category] = cls_logits   # [B, N, C]
 
         if reg_prior:
-            return reg_proposals, cur_anchors, accept_logits
+            return reg_proposals, cur_anchors, accept_logits, ownership_logits
         else:
-            return reg_proposals, None, accept_logits
+            return reg_proposals, None, accept_logits, ownership_logits
 
 
 
@@ -679,15 +747,23 @@ class Anchor3DLanePP(BaseModule):
                 accept_logits = None
                 if 'accept_logits' in output:
                     accept_logits = output['accept_logits'][iter_idx][feat_idx]
+                ownership_logits = None
+                if 'ownership_logits' in output:
+                    ownership_logits = output['ownership_logits'][iter_idx][feat_idx]
                 if accept_logits is None:
                     accept_iter = [None] * len(output['reg_proposals'][iter_idx][feat_idx])
                 else:
                     accept_iter = accept_logits
-                for proposal, anchor, accept_logit in zip(
+                if ownership_logits is None:
+                    ownership_iter = [None] * len(output['reg_proposals'][iter_idx][feat_idx])
+                else:
+                    ownership_iter = ownership_logits
+                for proposal, anchor, accept_logit, owner_logit in zip(
                         output['reg_proposals'][iter_idx][feat_idx],
                         output['anchors'][iter_idx][feat_idx],
-                        accept_iter):
-                    proposals_list.append((proposal, anchor, accept_logit))
+                        accept_iter,
+                        ownership_iter):
+                    proposals_list.append((proposal, anchor, accept_logit, owner_logit))
                 anchor_losses = self.lane_loss[f'loss_{feat_idx}'][iter_idx](proposals_list, gt_3dlanes)
                 for k, v in anchor_losses['losses'].items():
                     if 'loss' in k:

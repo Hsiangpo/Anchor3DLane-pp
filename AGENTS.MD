@@ -1,4 +1,4 @@
-[系统状态]：Anchor3DLane-pp is deployed and the official checkpoint baseline is reproduced on OpenLane validation, current stable F1 = 62.568; latest successful experiment is `lpf_t`; latest failed experiment is `mp_bfr`; current running experiment is none; ApolloSim is not mounted yet.
+[系统状态]：Anchor3DLane-pp is deployed and the official checkpoint baseline is reproduced on OpenLane validation, current stable F1 = 62.574; latest successful experiment is `lof_oc`; latest failed experiment is `brf_lpf`; current running experiment is none; ApolloSim is not mounted yet.
 
 # Anchor3DLane-pp Agent Notes
 
@@ -35,12 +35,30 @@
   - Result file: `/root/autodl-tmp/Anchor3DLane-pp/output/openlane/baseline_eval/evaluation_result.json`
   - Metrics: F1 `0.6240448139487519`, recall `0.613268850798542`, precision `0.6352062468171787`, category accuracy `0.9337897428296154`.
 - Current stable score:
-  - Experiment: `strip_sample + vdcc + eac_dr + frt_eat + lpf_t` / Lane-Point Field Transformer.
-  - Result file: `/root/autodl-tmp/Anchor3DLane-pp/output/openlane/experiments/lpf_t_r50x2_eval/evaluation_result.json`.
-  - Metrics: F1 `0.6256777375241412`, recall `0.6125127502799712`, precision `0.6394210764360018`, category accuracy `0.9367344267200269`.
-  - Improvement over previous stable `strip_sample + vdcc + eac_dr + frt_eat`: `+0.0001310671861248` F1, or `+0.013107` points on the 0-100 reporting scale.
-  - Improvement over official checkpoint baseline: `+0.0016329235753893` F1, or `+0.163292` points on the 0-100 reporting scale.
+  - Experiment: `strip_sample + vdcc + eac_dr + frt_eat + lpf_t + lof_oc` / Lane Ownership Field with Ownership Contrast.
+  - Result file: `/root/autodl-tmp/Anchor3DLane-pp/output/openlane/experiments/lof_oc_r50x2_eval/evaluation_result.json`.
+  - Metrics: F1 `0.6257406098709484`, recall `0.6168139636073128`, precision `0.6349294264784706`, category accuracy `0.9351244296780283`.
+  - Improvement over previous stable `strip_sample + vdcc + eac_dr + frt_eat + lpf_t`: `+0.0000628723468071` F1, or `+0.006287` points on the 0-100 reporting scale.
+  - Improvement over official checkpoint baseline: `+0.0016957959221965` F1, or `+0.169580` points on the 0-100 reporting scale.
 - Latest successful score-improvement experiment:
+  - Selected idea: LOF-OC / Lane Ownership Field with Ownership Contrast.
+  - Rationale: LPF-T raised precision but reduced recall, and BRF-LPF showed same-slot score floors are too weak. LOF-OC keeps the 30-proposal inference path, matcher, NMS, and thresholds unchanged, then models lane-slot ownership relations at the final `[B, C=128, N=30, L=20]` token field. It uses evaluator-clean and FRT-clean ownership labels so clean duplicate candidates can support a lane-level MIL objective without turning near-GT ambiguous proposals into geometry positives.
+  - Code: `mmseg/models/lane_detector/field/lane_ownership_field.py` adds `LaneOwnershipField`; `mmseg/models/lane_detector/anchor_3dlane_pp.py` adds optional final-only `ownership_field`; `mmseg/models/losses/lane_loss_v2.py` adds `ownership_contrast_losses`, `ownership_mil_losses`, owner-clean negative removal, and `batch_owner_*` logging; config is `configs_v2/openlane/experiments/anchor3dlane++_r50x2_lof_oc.py`.
+  - Checkpoint source: `output/openlane/experiments/lpf_t_r50x2/iter_10000.pth`.
+  - Validation gates passed:
+    - Local and remote `py_compile` and `git diff --check` passed.
+    - Code review subagent found no blocking/high/medium OOM, tensor-shape, DDP, checkpoint-load, freeze-mode, or failed-route issue.
+    - Remote config/model/checkpoint load passed; expected missing keys are only `ownership_field.*`, `unexpected=[]`, and trainable parameters are limited to `ownership_field.*` and `accept_calib_head.*`.
+    - Remote synthetic sanity passed: ownership field output shape `[2, 128, 30, 20]`, owner logits shape `[2, 30, 30]`, zero-init delta `0.0`, and finite ownership losses.
+    - Remote 2-GPU DDP 1-iter and 20-iter smoke passed with memory about `18976MB`, nonzero owner metrics, finite losses and grad norm, and no OOM/NaN/Traceback/Killed/DDP hard error.
+  - Formal training and validation completed:
+    - Training log: `logs/train_lof_oc_20260512_105156.log`.
+    - Final checkpoint: `output/openlane/experiments/lof_oc_r50x2/iter_10000.pth`.
+    - Evaluation log: `logs/eval_lof_oc_20260512_112646.log`.
+    - Result file: `output/openlane/experiments/lof_oc_r50x2_eval/evaluation_result.json`.
+    - Metrics: F1 `0.6257406098709484`, recall `0.6168139636073128`, precision `0.6349294264784706`, category accuracy `0.9351244296780283`.
+  - Decision: LOF-OC improves over previous stable LPF-T F1 `0.6256777375241412` and official baseline F1 `0.6240448139487519`; keep the implementation, record it in `docs/实验记录.md`, and commit/push this stable version. The minimum target F1 > 65 is still not reached.
+- Previous successful score-improvement experiment:
   - Selected idea: LPF-T / Lane-Point Field Transformer.
   - Rationale: repeated loss/ranking changes often disturb precision/recall. LPF-T instead changes the internal final-stage representation before flattening each proposal into a lane token: it applies longitudinal attention along the 20 y-points of each lane and lateral attention across the 30 lane slots at the same y-step. This preserves the 30-candidate inference path, NMS, thresholds, matcher, and FRT/EAC losses while giving the model a structured `lane x point` field before final classification/regression.
   - Code: `mmseg/models/lane_detector/field/lane_point_field.py` adds `LanePointFieldTransformer`; `mmseg/models/lane_detector/field/__init__.py` exports it; `mmseg/models/lane_detector/anchor_3dlane_pp.py` adds optional final-only `lane_point_field`; config is `configs_v2/openlane/experiments/anchor3dlane++_r50x2_lpf_t.py`.
@@ -59,6 +77,25 @@
     - Metrics: F1 `0.6256777375241412`, recall `0.6125127502799712`, precision `0.6394210764360018`, category accuracy `0.9367344267200269`.
   - Decision: LPF-T improves over previous stable FRT-EAT F1 `0.6255466703380164` and official baseline F1 `0.6240448139487519`; keep the implementation, record it in `docs/实验记录.md`, and commit/push this stable version. The minimum target F1 > 65 is still not reached.
 - Latest failed score-improvement experiment:
+  - Selected idea: BRF-LPF / Bypass Recall Floor for Lane-Point Field.
+  - Rationale: LPF-T improved precision but slightly reduced recall. BRF-LPF keeps the 30-proposal inference path, matcher, NMS, thresholds, and near-GT negative pool unchanged. It uses a no-grad teacher path from the pre-LPF final anchor features, then applies a conservative one-sided score/accept/rank floor only when both teacher and student are evaluator-clean and own the same GT lane.
+  - Code was rolled back. The failed implementation temporarily added optional `recall_guard` and `predict_from_anchor_features()` to `mmseg/models/lane_detector/anchor_3dlane_pp.py`; it also added optional `recall_guard_losses`, owner-slot selection, score-floor loss, rank-floor loss, and `batch_recall_guard_*` logging to `mmseg/models/losses/lane_loss_v2.py`. The failed config was `configs_v2/openlane/experiments/anchor3dlane++_r50x2_brf_lpf.py`.
+  - Checkpoint source: `output/openlane/experiments/frt_eat_r50x2/iter_8000.pth`.
+  - Validation gates passed:
+    - Local and remote `py_compile` and target-file `git diff --check` passed.
+    - Code review subagent found no blocking/high/medium OOM, tensor-shape, DDP, checkpoint-load, freeze-mode, or failed-route issue.
+    - Remote config/model/checkpoint load passed; expected missing keys are only `lane_point_field.*`, and trainable parameters are limited to `lane_point_field.*` and `accept_calib_head.*`.
+    - Remote synthetic sanity passed: the recall guard produces finite nonzero loss when teacher is stronger than student, and safely returns zero for empty targets or missing teacher tensors.
+    - Remote 2-GPU DDP 1-iter and 20-iter smoke passed with memory about `18976MB`, nonzero `batch_recall_guard_owner_pos`, finite losses and grad norm, and no OOM/NaN/Traceback/Killed/DDP hard error.
+  - Formal training and validation completed:
+    - Training log: `logs/train_brf_lpf_20260512_093248.log`.
+    - Final checkpoint: `output/openlane/experiments/brf_lpf_r50x2/iter_10000.pth`.
+    - Evaluation log: `logs/eval_brf_lpf_20260512_100542.log`.
+    - Result file: `output/openlane/experiments/brf_lpf_r50x2_eval/evaluation_result.json`.
+    - Metrics: F1 `0.6256699349570143`, recall `0.6124200209710898`, precision `0.6395058602228332`, category accuracy `0.9365190648457145`.
+  - Decision: BRF-LPF regressed very slightly below current stable LPF-T F1 `0.6256777375241412`; failed code/config are rolled back and the failure is documented in `docs/失败路线.md`.
+  - Avoid repeating pre-LPF no-grad teacher score-floor recall guard or only tuning `recall_guard_losses`, score/accept/rank margins, or top-k.
+- Previous failed score-improvement experiment:
   - Selected idea: MP-BFR / Multi-Positive Boundary Fine Refinement.
   - Rationale: FRT-EAT improved calibration but the model still has very few Hungarian positives per image. MP-BFR keeps the 30-proposal inference path unchanged and adds final-only multi-positive boundary supervision: clean duplicate and near-GT repair proposals are removed from the classification negative pool and receive extra geometry/visibility supervision.
   - Code was rolled back. The failed implementation temporarily added optional `boundary_refine_losses`, boundary clean/repair proposal selection, `batch_boundary_clean`, `batch_boundary_repair`, and `batch_boundary_ignore` logging to `mmseg/models/losses/lane_loss_v2.py`; FRT dirty proposals were ignore-only and could not be selected for boundary supervision. The failed config was `configs_v2/openlane/experiments/anchor3dlane++_r50x2_mp_bfr.py`.

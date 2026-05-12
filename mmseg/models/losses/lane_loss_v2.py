@@ -54,6 +54,8 @@ class LaneLossV2(nn.Module):
                  frt_slack=0.15,
                  frt_dirty_thresh=0.10,
                  frt_rank_weight=0.25,
+                 ownership_unique_margin=0.15,
+                 ownership_mil_temperature=0.5,
                  assign_cfg=None):
         super(LaneLossV2, self).__init__()
         self.focal_alpha = focal_alpha
@@ -71,6 +73,8 @@ class LaneLossV2(nn.Module):
         self.curve_geom = ('curve_geom_losses' in loss_weights.keys())
         self.accept_calib = ('accept_calib_losses' in loss_weights.keys())
         self.dup_rank = ('dup_rank_losses' in loss_weights.keys())
+        self.ownership_contrast = ('ownership_contrast_losses' in loss_weights.keys())
+        self.ownership_mil = ('ownership_mil_losses' in loss_weights.keys())
         self.curve_geom_axes = tuple(curve_geom_axes)
         assert len(self.anchor_steps) == self.anchor_len
         assert set(self.curve_geom_axes).issubset({'x', 'z'})
@@ -94,6 +98,8 @@ class LaneLossV2(nn.Module):
         self.frt_slack = float(frt_slack)
         self.frt_dirty_thresh = float(frt_dirty_thresh)
         self.frt_rank_weight = float(frt_rank_weight)
+        self.ownership_unique_margin = float(ownership_unique_margin)
+        self.ownership_mil_temperature = float(ownership_mil_temperature)
         self.register_buffer('anchor_y_steps_tensor',
                              torch.as_tensor(anchor_steps, dtype=torch.float32),
                              persistent=False)
@@ -321,6 +327,120 @@ class LaneLossV2(nn.Module):
         stats['ignore'] = stats['ignore'] + ignore_count
         stats['rank_pairs'] = stats['rank_pairs'] + rank_pairs
         stats['frt_dirty'] = stats['frt_dirty'] + frt_dirty
+
+    def ownership_labels(self, proposals, target):
+        num_props = proposals.shape[0]
+        device = proposals.device
+        if target.shape[0] == 0:
+            empty = torch.zeros(num_props, 0, dtype=torch.bool, device=device)
+            return empty, torch.zeros(num_props, dtype=torch.bool, device=device)
+
+        x_pred = proposals[:, 5:5+self.anchor_len]
+        z_pred = proposals[:, 5+self.anchor_len:5+self.anchor_len*2]
+        vis_pred = proposals[:, 5+self.anchor_len*2:5+self.anchor_len*3]
+        pred_mask = self.refined_visibility_mask(vis_pred)
+        x_target = target[:, 5:5+self.anchor_len]
+        z_target = target[:, 5+self.anchor_len:5+self.anchor_len*2]
+        vis_target = target[:, 5+self.anchor_len*2:5+self.anchor_len*3] > 0.5
+
+        dist = ((x_pred[:, None, :] - x_target[None, :, :]) ** 2 +
+                (z_pred[:, None, :] - z_target[None, :, :]) ** 2).clamp_min(1e-8).sqrt()
+        pair_mask = pred_mask[:, None, :] & vis_target[None, :, :]
+        hit = (dist <= self.accept_dist_thresh) & pair_mask
+        hit_count = hit.to(proposals.dtype).sum(dim=2)
+        gt_visible = vis_target.to(proposals.dtype).sum(dim=1).clamp_min(1.0)
+        pred_visible = pred_mask.to(proposals.dtype).sum(dim=1).clamp_min(1.0)
+        cover = hit_count / gt_visible.view(1, -1)
+        purity = hit_count / pred_visible.view(-1, 1)
+        pair_accept = (cover >= self.accept_cover_thresh) & (purity >= self.accept_purity_thresh)
+        if self.frt_enable:
+            ribbon_violation = self.ribbon_pair_violation(
+                x_pred, pred_mask, x_target, vis_target)
+            pair_accept = pair_accept & (ribbon_violation <= self.frt_dirty_thresh)
+
+        hit_cost = (dist * hit.to(dist.dtype)).sum(dim=2) / hit_count.clamp_min(1.0)
+        pair_cost = torch.where(pair_accept, hit_cost, dist.new_full(hit_cost.shape, 1e6))
+        sorted_cost, _ = pair_cost.sort(dim=1)
+        best_cost = sorted_cost[:, 0]
+        second_cost = sorted_cost[:, 1] if target.shape[0] > 1 else sorted_cost[:, 0].new_full(
+            best_cost.shape, 1e6)
+        unique = (best_cost < 1e5) & ((second_cost - best_cost) >= self.ownership_unique_margin)
+        owner_mask = pair_accept & (pair_cost == best_cost[:, None]) & unique[:, None]
+        return owner_mask, owner_mask.any(dim=1)
+
+    def ownership_contrast_loss(self, owner_logit, owner_mask):
+        if owner_logit is None or owner_mask.shape[1] == 0:
+            zero = self.zero_loss(owner_logit if owner_logit is not None else owner_mask.float())
+            return zero, zero
+        owner_logit = 0.5 * (owner_logit + owner_logit.transpose(0, 1))
+        prop_target = owner_mask.float().argmax(dim=1)
+        owner_clean = owner_mask.any(dim=1)
+        pair_valid = owner_clean[:, None] & owner_clean[None, :]
+        pair_valid = torch.triu(pair_valid, diagonal=1)
+        if not bool(pair_valid.any()):
+            zero = self.zero_loss(owner_logit)
+            return zero, owner_logit.new_tensor(0.)
+        same_target = prop_target[:, None] == prop_target[None, :]
+        pos_pair = pair_valid & same_target
+        neg_pair = pair_valid & ~same_target
+        losses = []
+        pair_count = owner_logit.new_tensor(0.)
+        if bool(pos_pair.any()):
+            losses.append(F.binary_cross_entropy_with_logits(
+                owner_logit[pos_pair], torch.ones_like(owner_logit[pos_pair])))
+            pair_count = pair_count + pos_pair.to(owner_logit.dtype).sum()
+        if bool(neg_pair.any()):
+            losses.append(F.binary_cross_entropy_with_logits(
+                owner_logit[neg_pair], torch.zeros_like(owner_logit[neg_pair])))
+            pair_count = pair_count + neg_pair.to(owner_logit.dtype).sum()
+        if not losses:
+            return self.zero_loss(owner_logit), pair_count
+        return sum(losses) / len(losses), pair_count
+
+    def ownership_mil_loss(self, proposals, target, owner_mask):
+        if owner_mask.shape[1] == 0:
+            zero = self.zero_loss(proposals)
+            return zero, zero, zero
+        cls_logits = proposals[:, 5+self.anchor_len*3:]
+        cls_probs = F.softmax(cls_logits / self.ownership_mil_temperature, dim=1)
+        losses = []
+        clean_count = owner_mask.any(dim=1).to(proposals.dtype).sum()
+        lane_count = proposals.new_tensor(0.)
+        for tgt_idx in range(target.shape[0]):
+            prop_mask = owner_mask[:, tgt_idx]
+            if not bool(prop_mask.any()):
+                continue
+            target_cls = target[tgt_idx, 1].long().clamp(0, cls_logits.shape[1] - 1)
+            probs = cls_probs[prop_mask, target_cls].clamp(1e-6, 1. - 1e-6)
+            lane_prob = 1. - (1. - probs).prod()
+            losses.append(-torch.log(lane_prob.clamp_min(1e-6)))
+            lane_count = lane_count + proposals.new_tensor(1.)
+        if not losses:
+            return self.zero_loss(proposals), lane_count, clean_count
+        return sum(losses) / len(losses), lane_count, clean_count
+
+    def init_ownership_stats(self, proposals):
+        zero = proposals.new_tensor(0.)
+        return dict(contrast_loss=zero, mil_loss=zero, lanes=zero, clean=zero,
+                    removed_from_neg=zero, pairs=zero)
+
+    def update_ownership_stats(self, stats, proposals, target, owner_logit):
+        if stats is None:
+            return torch.zeros(proposals.shape[0], dtype=torch.bool, device=proposals.device)
+        owner_mask, owner_clean = self.ownership_labels(proposals.detach(), target.detach())
+        if self.ownership_contrast:
+            contrast_loss, pair_count = self.ownership_contrast_loss(owner_logit, owner_mask)
+            stats['contrast_loss'] = stats['contrast_loss'] + contrast_loss
+            stats['pairs'] = stats['pairs'] + pair_count
+        if self.ownership_mil:
+            mil_loss, lane_count, clean_count = self.ownership_mil_loss(
+                proposals, target, owner_mask)
+            stats['mil_loss'] = stats['mil_loss'] + mil_loss
+            stats['lanes'] = stats['lanes'] + lane_count
+            stats['clean'] = stats['clean'] + clean_count
+            stats['removed_from_neg'] = (stats['removed_from_neg'] +
+                                         owner_clean.to(proposals.dtype).sum())
+        return owner_clean
         
     def forward(self, proposals_list, targets):
         if self.use_sigmoid:
@@ -339,6 +459,8 @@ class LaneLossV2(nn.Module):
         if self.curve_geom:
             curve_geom_losses = 0
         accept_stats = self.init_accept_stats(proposals_list[0][0]) if self.accept_calib else None
+        ownership_enabled = self.ownership_contrast or self.ownership_mil
+        ownership_stats = self.init_ownership_stats(proposals_list[0][0]) if ownership_enabled else None
         valid_imgs = len(targets)
         total_positives = 0
         total_negatives = 0
@@ -347,12 +469,14 @@ class LaneLossV2(nn.Module):
             num_clses = proposals.shape[1] - 5 - self.anchor_len * 3
             anchors = proposals_list[idx][1]
             accept_logit = proposals_list[idx][2] if len(proposals_list[idx]) > 2 else None
+            owner_logit = proposals_list[idx][3] if len(proposals_list[idx]) > 3 else None
             target = targets[idx]
             # Filter lanes that do not exist (confidence == 0)
             target = target[target[:, 1] > 0]   # [N, 605]
             if len(target) == 0:
                 empty_target = proposals.new_zeros((0, 5 + self.anchor_len * 3))
                 self.update_accept_stats(accept_stats, proposals, empty_target, accept_logit)
+                self.update_ownership_stats(ownership_stats, proposals, empty_target, owner_logit)
                 # If there are no targets, all proposals have to be negatives (i.e., 0 confidence)
                 cls_target = proposals.new_zeros(len(proposals)).long()
                 cls_pred = proposals[:, 5+self.anchor_len*3:]
@@ -376,6 +500,8 @@ class LaneLossV2(nn.Module):
             vis_target = target.index_select(1, vis_indices)   # [N, 10]
             target = torch.cat((target[:, :5], x_target, z_target, vis_target), dim=1)   # [N, 35]
             self.update_accept_stats(accept_stats, proposals, target, accept_logit)
+            owner_clean = self.update_ownership_stats(
+                ownership_stats, proposals, target, owner_logit)
             with torch.no_grad():
                 if self.anchor_assign:
                     anchor_assign = torch.cat([anchors, proposals[:, 65:]], 1)
@@ -388,6 +514,8 @@ class LaneLossV2(nn.Module):
             total_positives += num_positives
             negatives_mask = torch.ones(proposals.shape[0], dtype=torch.bool, device=proposals.device)
             negatives_mask[indices_src] = False
+            if self.ownership_mil:
+                negatives_mask[owner_clean] = False
             negatives = proposals[negatives_mask]
             num_negatives = len(negatives)
             total_negatives += num_negatives
@@ -395,8 +523,14 @@ class LaneLossV2(nn.Module):
             # Handle edge case of no positives found
             if num_positives == 0:
                 cls_target = proposals.new_zeros(len(proposals)).long()
-                cls_pred = proposals[:, :2]
-                cls_losses += focal_loss(cls_pred, cls_target).sum()
+                cls_pred = proposals[:, 5+self.anchor_len*3:]
+                if self.ownership_mil:
+                    cls_pred = cls_pred[~owner_clean]
+                    cls_target = cls_target[~owner_clean]
+                if cls_pred.numel() > 0:
+                    cls_losses += focal_loss(cls_pred, cls_target).sum()
+                else:
+                    cls_losses += self.zero_loss(proposals)
                 reg_losses_x += smooth_l1_loss(cls_pred, cls_pred).sum() * 0  # avoid dividing zeros
                 reg_losses_z += smooth_l1_loss(cls_pred, cls_pred).sum() * 0
                 reg_losses_vis += smooth_l1_loss(cls_pred, cls_pred).sum() * 0
@@ -487,6 +621,12 @@ class LaneLossV2(nn.Module):
         if self.dup_rank:
             dup_rank_losses = accept_stats['rank_loss'] / valid_imgs
             losses['dup_rank_losses'] = dup_rank_losses
+        if self.ownership_contrast:
+            ownership_contrast_losses = ownership_stats['contrast_loss'] / valid_imgs
+            losses['ownership_contrast_losses'] = ownership_contrast_losses
+        if self.ownership_mil:
+            ownership_mil_losses = ownership_stats['mil_loss'] / valid_imgs
+            losses['ownership_mil_losses'] = ownership_mil_losses
 
         for k in losses.keys():
             losses[k] = losses[k] * self.loss_weights[k]
@@ -501,4 +641,9 @@ class LaneLossV2(nn.Module):
             result['batch_dup_rank_pairs'] = accept_stats['rank_pairs'] / bs
         if self.accept_calib and self.frt_enable:
             result['batch_frt_dirty'] = accept_stats['frt_dirty'] / bs
+        if ownership_enabled:
+            result['batch_owner_lanes'] = ownership_stats['lanes'] / bs
+            result['batch_owner_clean'] = ownership_stats['clean'] / bs
+            result['batch_owner_removed_from_neg'] = ownership_stats['removed_from_neg'] / bs
+            result['batch_owner_pairs'] = ownership_stats['pairs'] / bs
         return result

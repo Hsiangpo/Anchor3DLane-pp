@@ -283,23 +283,11 @@ class Anchor3DLanePP(BaseModule):
         self.lane_evidence_field_enabled = True
         self.lane_evidence_field_trainable = bool(cfg.pop('trainable', True))
         self.lane_evidence_field_apply = cfg.pop('apply', 'final')
-        hidden_channels = int(cfg.pop('hidden_channels', self.anchor_feat_channels))
-        gate_init = float(cfg.pop('gate_init', -2.1972246))
-        detach_sample = bool(cfg.pop('detach_sample', True))
-        loss_weight = float(cfg.pop('loss_weight', 0.02))
-        pos_weight = float(cfg.pop('pos_weight', 10.0))
-        target_radius = int(cfg.pop('target_radius', 1))
-        if cfg:
-            raise ValueError(f'Unsupported lane_evidence_field options: {sorted(cfg.keys())}')
+        cfg.setdefault('geometry_norm', (self.x_norm, self.y_norm, self.z_norm))
         self.lane_evidence_field = LaneEvidenceField(
             self.anchor_feat_channels,
             self.proj_channel,
-            hidden_channels=hidden_channels,
-            gate_init=gate_init,
-            detach_sample=detach_sample,
-            loss_weight=loss_weight,
-            pos_weight=pos_weight,
-            target_radius=target_radius)
+            **cfg)
 
     def build_accept_calib(self, accept_calib):
         self.accept_calib = False
@@ -733,7 +721,8 @@ class Anchor3DLanePP(BaseModule):
                     f'got {batch_anchor_features.shape[1]} at layer {feat_idx}/{iter_idx}')
             batch_anchor_features, evidence_logits, _ = self.lane_evidence_field(
                 batch_anchor_features, anchor_feat, batch_us, batch_vs,
-                valid_mask=valid_mask)
+                valid_mask=valid_mask, geometry=batch_geometry,
+                project_matrixes=project_matrixes)
 
         batch_anchor_features = batch_anchor_features.transpose(1, 2)  # [B, N, C, l]
         batch_anchor_features = batch_anchor_features.flatten(2, 3)  # [B, N, C*l]

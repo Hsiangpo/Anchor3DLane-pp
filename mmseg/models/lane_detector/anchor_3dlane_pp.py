@@ -20,6 +20,7 @@ import torch.nn.functional as F
 from mmcv.runner import BaseModule, auto_fp16, force_fp32
 
 from ..builder import LANENET2S, build_backbone, build_loss, build_neck
+from .field import LanePointFieldTransformer
 from .tools import homography_crop_resize
 from .utils import AnchorGenerator_torch, DecodeLayer, nms_3d
 
@@ -77,6 +78,7 @@ class Anchor3DLanePP(BaseModule):
                  strip_center_bias=2.0,
                  strip_apply='all',
                  accept_calib=None,
+                 lane_point_field=None,
                  loss_lane = None,
                  loss_aux = None,
                  init_cfg = None,
@@ -187,6 +189,7 @@ class Anchor3DLanePP(BaseModule):
             self.anchor_feat_channels, 3, bias=False) for i in range(self.iter_reg)])
         self.expert_layer = ExpertDecode(self.anchor_feat_channels * self.feat_sizes[-1][1], self.anchor_num * self.x_num, \
                                           self.anchor_num * self.yaw_num, self.anchor_num * self.pitch_num, self.anchor_num)
+        self.build_lane_point_field(lane_point_field)
         self.build_accept_calib(accept_calib)
         for i in range(self.iter_reg):
             nn.init.zeros_(self.reg_prior_layer[i].layer[-1].weight.data)
@@ -204,6 +207,34 @@ class Anchor3DLanePP(BaseModule):
                 self.lane_loss[f'loss_{idx}'] = [build_loss(l) for l in loss_lane[idx]]
         if getattr(self, 'accept_calib_freeze_base', False):
             self.freeze_base_for_accept_calib()
+
+    def build_lane_point_field(self, lane_point_field):
+        self.lane_point_field = None
+        self.lane_point_field_enabled = False
+        self.lane_point_field_apply = 'final'
+        if lane_point_field is None:
+            return
+        cfg = lane_point_field.copy()
+        if not cfg.pop('enabled', True):
+            return
+        self.lane_point_field_enabled = True
+        self.lane_point_field_apply = cfg.pop('apply', 'final')
+        num_heads = int(cfg.pop('num_heads', 4))
+        ffn_ratio = float(cfg.pop('ffn_ratio', 2.0))
+        dropout = float(cfg.pop('dropout', 0.0))
+        gate_init = float(cfg.pop('gate_init', -2.1972246))
+        use_geometry = bool(cfg.pop('use_geometry', True))
+        detach_geometry = bool(cfg.pop('detach_geometry', True))
+        if cfg:
+            raise ValueError(f'Unsupported lane_point_field options: {sorted(cfg.keys())}')
+        self.lane_point_field = LanePointFieldTransformer(
+            self.proj_channel,
+            num_heads=num_heads,
+            ffn_ratio=ffn_ratio,
+            dropout=dropout,
+            gate_init=gate_init,
+            use_geometry=use_geometry,
+            detach_geometry=detach_geometry)
 
     def build_accept_calib(self, accept_calib):
         self.accept_calib = False
@@ -230,17 +261,29 @@ class Anchor3DLanePP(BaseModule):
         nn.init.zeros_(self.accept_calib_head.layer[-1].weight.data)
         nn.init.constant_(self.accept_calib_head.layer[-1].bias.data, bias_init)
 
+    def frozen_base_trainable_prefixes(self):
+        prefixes = ['accept_calib_head.']
+        if getattr(self, 'lane_point_field_enabled', False):
+            prefixes.append('lane_point_field.')
+        return tuple(prefixes)
+
     def freeze_base_for_accept_calib(self):
+        prefixes = self.frozen_base_trainable_prefixes()
         for name, param in self.named_parameters():
-            param.requires_grad_(name.startswith('accept_calib_head.'))
+            param.requires_grad_(name.startswith(prefixes))
 
     def train(self, mode=True):
         super(Anchor3DLanePP, self).train(mode)
         if mode and getattr(self, 'accept_calib_freeze_base', False):
+            trainable_children = {'accept_calib_head'}
+            if getattr(self, 'lane_point_field_enabled', False):
+                trainable_children.add('lane_point_field')
             for name, module in self.named_children():
-                if name != 'accept_calib_head':
+                if name not in trainable_children:
                     module.eval()
             self.accept_calib_head.train(True)
+            if getattr(self, 'lane_point_field_enabled', False):
+                self.lane_point_field.train(True)
         return self
 
     def use_accept_calib(self, feat_idx, iter_idx):
@@ -251,6 +294,15 @@ class Anchor3DLanePP(BaseModule):
         if self.accept_calib_apply == 'all':
             return True
         raise ValueError(f'Unsupported accept_calib_apply: {self.accept_calib_apply}')
+
+    def use_lane_point_field(self, feat_idx, iter_idx):
+        if not getattr(self, 'lane_point_field_enabled', False):
+            return False
+        if self.lane_point_field_apply == 'final':
+            return feat_idx == self.feat_num - 1 and iter_idx == self.iter_reg - 1
+        if self.lane_point_field_apply == 'all':
+            return True
+        raise ValueError(f'Unsupported lane_point_field_apply: {self.lane_point_field_apply}')
 
     def load_pretrained(self, ckpt, strict=True):
         pth = torch.load(ckpt, map_location='cpu')
@@ -505,14 +557,16 @@ class Anchor3DLanePP(BaseModule):
         batch_size = project_matrixes.shape[0]
         xs, ys, zs = self.compute_anchor_cut_indices(proposals_prev, self.feat_y_steps)
         use_strip = self.use_strip_sample(feat_idx, iter_idx)
-        batch_anchor_features, _ = self.cut_anchor_features(
+        batch_anchor_features, valid_mask = self.cut_anchor_features(
             anchor_feat, project_matrixes, xs, ys, zs, self.anchor_feat_len, feat_size, use_strip)   # [B, C, N, l]
 
+        batch_geometry = None
         if self.with_pos != 'none':
             xs = xs / self.x_norm # [B, N*L]
             ys = ys / self.y_norm
             zs = zs / self.z_norm
             xyz = torch.stack([xs, ys, zs], -1)  # [B, NL, 3]
+            batch_geometry = xyz.reshape(batch_size, self.anchor_num, self.anchor_feat_len, 3)
             batch_pos_features = self.position_encoder(xyz)  # [B, NL, C]
             batch_pos_features = batch_pos_features.transpose(1, 2).reshape(batch_size, self.anchor_feat_channels, self.anchor_num, self.anchor_feat_len)
             if self.with_pos == 'add':
@@ -524,6 +578,14 @@ class Anchor3DLanePP(BaseModule):
                 batch_anchor_features = batch_anchor_features.permute(0, 3, 1, 2)  # [B, C, N, l]
             else:
                 batch_anchor_features = torch.cat([batch_anchor_features, batch_pos_features], 1)
+
+        if self.use_lane_point_field(feat_idx, iter_idx):
+            if batch_anchor_features.shape[1] != self.proj_channel:
+                raise ValueError(
+                    f'LanePointField expected {self.proj_channel} channels, '
+                    f'got {batch_anchor_features.shape[1]} at layer {feat_idx}/{iter_idx}')
+            batch_anchor_features = self.lane_point_field(
+                batch_anchor_features, valid_mask=valid_mask, geometry=batch_geometry)
 
         batch_anchor_features = batch_anchor_features.transpose(1, 2)  # [B, N, C, l]
         batch_anchor_features = batch_anchor_features.flatten(2, 3)  # [B, N, C*l]

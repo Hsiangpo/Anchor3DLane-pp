@@ -1,4 +1,4 @@
-[系统状态]：Anchor3DLane-pp is deployed and the official checkpoint baseline is reproduced on OpenLane validation, current stable F1 = 62.555; latest successful experiment is `frt_eat`; latest failed experiment is `pcaug_eac`; current running experiment is none; ApolloSim is not mounted yet.
+[系统状态]：Anchor3DLane-pp is deployed and the official checkpoint baseline is reproduced on OpenLane validation, current stable F1 = 62.568; latest successful experiment is `lpf_t`; latest failed experiment is `mp_bfr`; current running experiment is none; ApolloSim is not mounted yet.
 
 # Anchor3DLane-pp Agent Notes
 
@@ -35,12 +35,54 @@
   - Result file: `/root/autodl-tmp/Anchor3DLane-pp/output/openlane/baseline_eval/evaluation_result.json`
   - Metrics: F1 `0.6240448139487519`, recall `0.613268850798542`, precision `0.6352062468171787`, category accuracy `0.9337897428296154`.
 - Current stable score:
-  - Experiment: `strip_sample + vdcc + eac_dr + frt_eat` / Frenet road-ribbon topology with evaluator-aware training.
-  - Result file: `/root/autodl-tmp/Anchor3DLane-pp/output/openlane/experiments/frt_eat_r50x2_eval/evaluation_result.json`.
-  - Metrics: F1 `0.6255466703380164`, recall `0.6164715784668279`, precision `0.634892943535696`, category accuracy `0.9358638012838404`.
-  - Improvement over previous stable `strip_sample + vdcc + eac_dr`: `+0.000047901231777336406` F1, or `+0.004790` points on the 0-100 reporting scale.
-  - Improvement over official checkpoint baseline: `+0.0015018563892644776` F1, or `+0.150186` points on the 0-100 reporting scale.
+  - Experiment: `strip_sample + vdcc + eac_dr + frt_eat + lpf_t` / Lane-Point Field Transformer.
+  - Result file: `/root/autodl-tmp/Anchor3DLane-pp/output/openlane/experiments/lpf_t_r50x2_eval/evaluation_result.json`.
+  - Metrics: F1 `0.6256777375241412`, recall `0.6125127502799712`, precision `0.6394210764360018`, category accuracy `0.9367344267200269`.
+  - Improvement over previous stable `strip_sample + vdcc + eac_dr + frt_eat`: `+0.0001310671861248` F1, or `+0.013107` points on the 0-100 reporting scale.
+  - Improvement over official checkpoint baseline: `+0.0016329235753893` F1, or `+0.163292` points on the 0-100 reporting scale.
 - Latest successful score-improvement experiment:
+  - Selected idea: LPF-T / Lane-Point Field Transformer.
+  - Rationale: repeated loss/ranking changes often disturb precision/recall. LPF-T instead changes the internal final-stage representation before flattening each proposal into a lane token: it applies longitudinal attention along the 20 y-points of each lane and lateral attention across the 30 lane slots at the same y-step. This preserves the 30-candidate inference path, NMS, thresholds, matcher, and FRT/EAC losses while giving the model a structured `lane x point` field before final classification/regression.
+  - Code: `mmseg/models/lane_detector/field/lane_point_field.py` adds `LanePointFieldTransformer`; `mmseg/models/lane_detector/field/__init__.py` exports it; `mmseg/models/lane_detector/anchor_3dlane_pp.py` adds optional final-only `lane_point_field`; config is `configs_v2/openlane/experiments/anchor3dlane++_r50x2_lpf_t.py`.
+  - Checkpoint source: `output/openlane/experiments/frt_eat_r50x2/iter_8000.pth`.
+  - Validation gates passed:
+    - Local and remote `py_compile` and `git diff --check` passed.
+    - Remote config/model/checkpoint load passed; expected missing keys are only `lane_point_field.*`, `unexpected=[]`, and trainable parameters are limited to `lane_point_field.*` and `accept_calib_head.*`.
+    - Remote standalone CUDA sanity passed: initial `out_proj` zero-init keeps `max_initial_delta=0.0`, output is finite, and `out_proj` receives gradients.
+    - Code review subagent found and the main agent fixed one blocking loss-registration indentation issue before formal training; no remaining blocking OOM, DDP, tensor-shape, checkpoint-load, or freeze-mode issue remained.
+    - Remote 2-GPU DDP 1-iter and 20-iter smoke passed with memory about `18976MB`, finite losses and grad norm, and no OOM/NaN/Traceback/Killed/DDP hard error.
+  - Formal training and validation completed:
+    - Training log: `logs/train_lpf_t_20260512_082504.log`.
+    - Final checkpoint: `output/openlane/experiments/lpf_t_r50x2/iter_10000.pth`.
+    - Evaluation log: `logs/eval_lpf_t_20260512_085209.log`.
+    - Result file: `output/openlane/experiments/lpf_t_r50x2_eval/evaluation_result.json`.
+    - Metrics: F1 `0.6256777375241412`, recall `0.6125127502799712`, precision `0.6394210764360018`, category accuracy `0.9367344267200269`.
+  - Decision: LPF-T improves over previous stable FRT-EAT F1 `0.6255466703380164` and official baseline F1 `0.6240448139487519`; keep the implementation, record it in `docs/实验记录.md`, and commit/push this stable version. The minimum target F1 > 65 is still not reached.
+- Latest failed score-improvement experiment:
+  - Selected idea: MP-BFR / Multi-Positive Boundary Fine Refinement.
+  - Rationale: FRT-EAT improved calibration but the model still has very few Hungarian positives per image. MP-BFR keeps the 30-proposal inference path unchanged and adds final-only multi-positive boundary supervision: clean duplicate and near-GT repair proposals are removed from the classification negative pool and receive extra geometry/visibility supervision.
+  - Code was rolled back. The failed implementation temporarily added optional `boundary_refine_losses`, boundary clean/repair proposal selection, `batch_boundary_clean`, `batch_boundary_repair`, and `batch_boundary_ignore` logging to `mmseg/models/losses/lane_loss_v2.py`; FRT dirty proposals were ignore-only and could not be selected for boundary supervision. The failed config was `configs_v2/openlane/experiments/anchor3dlane++_r50x2_mp_bfr.py`.
+  - Checkpoint source: `output/openlane/experiments/frt_eat_r50x2/iter_8000.pth`.
+  - Validation gates passed:
+    - Local and remote `py_compile` and `git diff --check` passed.
+    - Remote config/model/checkpoint load passed with `missing=[]` and `unexpected=[]`.
+    - Remote synthetic sanity passed: exact duplicate proposals are selected as clean, 1.8m near-GT proposals are selected as repair, far proposals remain negatives, and cross-neighbor FRT dirty proposals are ignore-only.
+    - Code review subagent found no blocking OOM, DDP, tensor-shape, checkpoint-load, or project-constraint issue; the FRT dirty selection risk was fixed before smoke.
+    - Remote 2-GPU DDP 1-iter and 20-iter smoke passed with memory about `27398MB`, nonzero `batch_boundary_repair`, finite losses and grad norm, and no OOM/NaN/Traceback/Killed/DDP hard error.
+  - Formal training completed:
+    - PID file: `logs/train_mp_bfr.pid`.
+    - Training log: `logs/train_mp_bfr_20260512_064029.log`.
+    - Final checkpoint: `output/openlane/experiments/mp_bfr_r50x2/iter_10000.pth`.
+    - Work dir: `output/openlane/experiments/mp_bfr_r50x2`.
+    - Config: `configs_v2/openlane/experiments/anchor3dlane++_r50x2_mp_bfr.py`.
+  - Formal validation evaluation completed:
+    - PID file: `logs/eval_mp_bfr.pid`.
+    - Evaluation log: `logs/eval_mp_bfr_20260512_074729.log`.
+    - Result file: `output/openlane/experiments/mp_bfr_r50x2_eval/evaluation_result.json`.
+    - Metrics: F1 `0.621979854494763`, recall `0.6121061679256453`, precision `0.6321773020348785`, category accuracy `0.9339583080951627`.
+  - Decision: MP-BFR regressed below current stable F1 `0.6255466703380164` and official baseline F1 `0.6240448139487519`; failed code/config are rolled back and the failure is documented in `docs/失败路线.md`.
+  - Avoid repeating near-GT unmatched proposal promotion, boundary clean/repair supervision, or only tuning boundary thresholds/top-k/loss weights.
+- Previous successful score-improvement experiment:
   - Selected idea: FRT-EAT / Frenet Road-Ribbon Topology with Evaluator-Aware Training.
   - Rationale: PC-Aug raised precision while collapsing recall, so this round protects EAC-DR's precision/recall balance instead of changing the image distribution. FRT-EAT keeps the 30-proposal geometry, matcher, NMS, and thresholds unchanged; it only changes the final evaluator-aware calibration target by using GT lane-local road ribbons to ignore or down-rank proposals that are evaluator-close but topologically crossing into a neighboring lane ribbon.
   - Code: `mmseg/models/losses/lane_loss_v2.py` adds optional `frt_enable`, GT-derived ribbon width, neighbor-gated ribbon violation logic inside `LaneLossV2.acceptance_labels`, and `batch_frt_dirty` logging; config is `configs_v2/openlane/experiments/anchor3dlane++_r50x2_frt_eat.py`.

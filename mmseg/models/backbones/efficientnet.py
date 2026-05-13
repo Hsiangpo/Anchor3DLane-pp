@@ -6,7 +6,10 @@ import torchvision.models as models
 from collections import OrderedDict
 from torch.utils.checkpoint import checkpoint
 from itertools import chain
-import geffnet
+try:
+    import geffnet
+except ModuleNotFoundError:
+    geffnet = None
 import pdb
 import os
 
@@ -105,6 +108,8 @@ class EfficientNet(nn.Module):
     def __init__(self, arch, lv6=True, lv5=True, lv4=True, lv3=True, pretrained=True, \
     stride=1, lv5_partial=False, with_cp=False):
         super(EfficientNet, self).__init__()
+        if geffnet is None:
+            raise ImportError('geffnet is required when building EfficientNet')
         self.pretrain_path = {'b5': 'pretrained/tf_efficientnet_b5_ns-6f26d0cf.pth',
                     'b4': 'pretrained/tf_efficientnet_b4_ns-d6313a46.pth', 
                     'b3': 'pretrained/tf_efficientnet_b3_ns-9d44bf68.pth', 
